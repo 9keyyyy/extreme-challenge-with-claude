@@ -4,6 +4,9 @@
 
 **전제:** Phase 4 완료. 캐시가 동작하는 상태. 좋아요/조회수는 아직 DB 직접 UPDATE.
 
+**학습 키워드**
+`Redis Single Thread` `INCR/DECR Atomicity` `Row Lock (Exclusive Lock)` `GETSET (atomic swap)` `Redis Persistence (RDB/AOF)` `Pipeline/MULTI` `Bulk UPDATE` `k6 Load Test` `Eventual Consistency`
+
 ---
 
 ## 학습: 왜 카운터를 Redis로 분리하는가
@@ -50,6 +53,16 @@ GETSET post:1:views 0
 ```
 
 이걸 30초마다 벌크로 실행 → DB 부하 최소화.
+
+### 심화 학습 — 더 깊이 파볼 키워드
+
+| 키워드 | 왜 알아야 하는지 |
+|--------|----------------|
+| **Redis Persistence (RDB/AOF)** | Redis 재시작 시 데이터 복구. RDB는 스냅샷, AOF는 명령 로그. 카운터 유실 위험도와 직결 |
+| **Redis Pipeline** | 여러 명령을 한 번에 보내서 네트워크 왕복 줄임. 벌크 카운터 조회 시 필수 |
+| **Redis MULTI/EXEC** | 트랜잭션. 여러 명령을 원자적으로 실행. INCR + EXPIRE를 묶을 때 사용 |
+| **Redis Memory Policy** | maxmemory 초과 시 어떤 키를 삭제할지. 카운터는 noeviction이어야 함 |
+| **HyperLogLog** | 고유 방문자 수(UV) 같은 근사 카운팅. 12KB로 수억 개 카운트 가능 |
 
 ---
 

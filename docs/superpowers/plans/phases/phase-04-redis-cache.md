@@ -4,6 +4,9 @@
 
 **전제:** Phase 3 완료. 인덱스 + 커서 페이지네이션이 적용된 상태.
 
+**학습 키워드**
+`Cache-Aside` `Write-Through` `Write-Behind` `Cache Stampede` `Thundering Herd` `Distributed Lock` `TTL` `LRU vs LFU` `Cache Invalidation` `Serialization (JSON vs MessagePack)` `Redis Data Types` `Cache Key Design`
+
 ---
 
 ## 학습: 캐시란 무엇이고 왜 필요한가
@@ -62,6 +65,17 @@ Redis 조회: 메모리 접근 = ~0.1ms
   - **LRU (Least Recently Used):** 가장 오래 안 쓴 것 제거. 범용적
   - **LFU (Least Frequently Used):** 가장 적게 쓴 것 제거. 인기 콘텐츠에 유리
   - **Random:** 무작위. 단순하지만 비효율적
+
+### 심화 학습 — 더 깊이 파볼 키워드
+
+| 키워드 | 왜 알아야 하는지 |
+|--------|----------------|
+| **Thundering Herd** | Cache Stampede의 또 다른 이름. 캐시 만료 순간 대량 요청이 DB로 몰리는 현상 |
+| **Cache Key Design** | `post:{id}:v{version}` 같은 키 설계. 키 충돌, 네임스페이스 분리, 버전 관리 전략 |
+| **Serialization (JSON vs MessagePack vs Protobuf)** | 캐시 직렬화 포맷. JSON은 읽기 쉽지만 느림, MessagePack은 빠르고 작음 |
+| **Redis Cluster vs Sentinel** | 고가용성 전략. Sentinel = 장애 감지 + 자동 페일오버, Cluster = 데이터 샤딩 |
+| **Cache Warming** | 서비스 시작 시 주요 데이터를 미리 캐시에 로드. Cold start 문제 해결 |
+| **Negative Caching** | 존재하지 않는 데이터도 캐싱. "게시글 없음"도 캐시하면 DB 접근 방지 |
 
 ---
 

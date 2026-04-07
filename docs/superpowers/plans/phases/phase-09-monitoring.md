@@ -4,6 +4,9 @@
 
 **전제:** Phase 8 완료. 전체 기능이 동작하는 상태.
 
+**학습 키워드**
+`Observability (Metrics/Traces/Logs)` `Prometheus (Pull 모델)` `Grafana Dashboard` `OpenTelemetry` `Jaeger (분산 추적)` `SLI/SLO/SLA` `RED Method` `USE Method` `Percentile (p50/p95/p99)` `PromQL` `Span/Trace`
+
 ---
 
 ## 학습: 왜 모니터링이 필요한가
@@ -39,6 +42,18 @@
 - **p99:** 99%의 요청이 이보다 빠름. "최악의 1% 유저 경험"
 
 극한 트래픽에서는 p99가 핵심. 100만 RPS의 1% = 1만 요청/초가 느린 것.
+
+### 심화 학습 — 더 깊이 파볼 키워드
+
+| 키워드 | 왜 알아야 하는지 |
+|--------|----------------|
+| **SLI / SLO / SLA** | SLI = 측정 지표 (p99 latency), SLO = 목표 (99.9%), SLA = 계약 (위반 시 보상). 모니터링의 목적 |
+| **RED Method** | Rate, Errors, Duration. 서비스 모니터링의 골든 시그널 |
+| **USE Method** | Utilization, Saturation, Errors. 인프라(CPU/메모리/디스크) 모니터링 |
+| **PromQL** | Prometheus 쿼리 언어. `rate()`, `histogram_quantile()` 등 필수 함수 |
+| **Span / Trace / Baggage** | 분산 추적의 기본 단위. Span = 하나의 작업, Trace = Span의 트리, Baggage = 전파되는 메타데이터 |
+| **Exemplar** | 메트릭에 trace ID를 연결. "p99가 느린 그 요청"을 바로 추적 가능 |
+| **Structured Logging** | JSON 형태 로그. `grep` 대신 쿼리로 검색. Loki/ELK에서 필수 |
 
 ---
 

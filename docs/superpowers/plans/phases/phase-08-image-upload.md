@@ -4,6 +4,9 @@
 
 **전제:** Phase 7 완료.
 
+**학습 키워드**
+`Presigned URL` `S3 Signature v4` `Multipart Upload` `Content-Type Validation` `Object Storage vs Block Storage` `Lifecycle Rule` `CDN (CloudFront)` `MinIO` `boto3` `CORS Preflight`
+
 ---
 
 ## 학습: 왜 서버를 거치면 안 되는가
@@ -39,6 +42,17 @@ S3 API 100% 호환 오픈소스. Docker 한 줄로 구동. 코드 변경 없이 
 | 업로드만 하고 게시글 안 씀 | tmp/ | Lifecycle Rule 24시간 자동 삭제 |
 | 게시글 작성 성공 | images/ (tmp→images 이동) | 영구 보관 |
 | 업로드 중 네트워크 끊김 | tmp/ (불완전) 또는 없음 | Presigned URL 만료 전 재시도 가능 |
+
+### 심화 학습 — 더 깊이 파볼 키워드
+
+| 키워드 | 왜 알아야 하는지 |
+|--------|----------------|
+| **S3 Signature v4** | Presigned URL의 서명 방식. 만료시간, 허용 크기, Content-Type이 서명에 포함되는 원리 |
+| **Multipart Upload** | 큰 파일(100MB+)을 조각내서 병렬 업로드. 네트워크 실패 시 해당 조각만 재전송 |
+| **Content-Type Spoofing** | 클라이언트가 image/jpeg라고 보내놓고 실행파일을 업로드하는 공격. 서버에서 매직바이트 검증 필요 |
+| **CDN (CloudFront)** | S3 앞에 CDN을 두면 이미지 요청이 엣지 서버에서 처리됨. 원본 S3 부하 제거 |
+| **Object Storage vs Block Storage** | S3(Object)는 HTTP API로 접근, EBS(Block)는 파일시스템으로 마운트. 용도가 다름 |
+| **CORS (Cross-Origin Resource Sharing)** | 브라우저에서 S3로 직접 업로드할 때 CORS 설정 필수. Preflight 요청 이해 필요 |
 
 ---
 

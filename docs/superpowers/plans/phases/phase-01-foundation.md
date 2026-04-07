@@ -2,6 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans
 
+**학습 키워드**
+`ASGI vs WSGI` `async/await` `이벤트 루프` `Connection Pool` `ORM vs Raw SQL` `Pydantic Validation` `Optimistic Locking` `UNIQUE Constraint` `UUID vs Auto-increment` `Docker Compose` `Alembic Migration`
+
 ---
 
 ## 학습: 왜 이 기술 스택인가?
@@ -47,6 +50,17 @@ async def get_post(id):
 ### Docker Compose — 왜 Docker인가?
 
 로컬에서 PostgreSQL + Redis + MinIO + 모니터링을 한 번에 띄울 수 있음. "내 컴퓨터에서는 되는데..." 방지. 클라우드 배포 시에도 같은 컨테이너 이미지 사용 가능.
+
+### 심화 학습 — 더 깊이 파볼 키워드
+
+| 키워드 | 왜 알아야 하는지 |
+|--------|----------------|
+| **ASGI vs WSGI** | FastAPI는 ASGI 기반. Django/Flask는 WSGI. 비동기 처리 방식의 근본적 차이 |
+| **uvicorn vs gunicorn** | ASGI 서버(uvicorn)와 WSGI 서버(gunicorn)의 차이. 프로덕션에서는 gunicorn + uvicorn worker 조합을 쓰는 이유 |
+| **UUID vs Auto-increment PK** | 분산 환경에서 auto-increment는 충돌 위험. UUID는 어디서든 생성 가능하지만 인덱스 성능에 영향 |
+| **Pydantic v2 내부 동작** | Rust 기반 검증 엔진으로 v1 대비 5-50배 빠름. model_dump, model_validate 동작 원리 |
+| **SQLAlchemy 2.0 스타일** | 1.x의 legacy query vs 2.0의 select() 스타일 차이. mapped_column이 Column을 대체한 이유 |
+| **Alembic autogenerate 한계** | 인덱스명 변경, 데이터 마이그레이션은 자동 감지 못 함. 수동 마이그레이션이 필요한 경우 |
 
 ---
 

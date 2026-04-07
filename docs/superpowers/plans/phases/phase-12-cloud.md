@@ -4,6 +4,9 @@
 
 **전제:** Phase 11 완료. 로컬에서 모든 기능 + 부하 + 장애 테스트 완료 상태.
 
+**학습 키워드**
+`ECS Fargate (Serverless Container)` `Terraform (IaC)` `VPC/Subnet/NAT` `ALB (Application Load Balancer)` `Health Check` `Auto Scaling` `12-Factor App` `Blue/Green Deployment` `IAM Role` `Security Group` `CloudWatch Logs`
+
 ---
 
 ## 학습: 컨테이너 오케스트레이션
@@ -75,6 +78,18 @@ Internet
 | **합계** | | **~$56** |
 
 Free Tier 적용 시 더 낮아질 수 있음. $100 예산 내 충분.
+
+### 심화 학습 — 더 깊이 파볼 키워드
+
+| 키워드 | 왜 알아야 하는지 |
+|--------|----------------|
+| **12-Factor App** | 클라우드 네이티브 앱의 12가지 원칙. 환경변수 설정, 로그 스트림, 프로세스 무상태 등 |
+| **Blue/Green Deployment** | 구버전/신버전을 동시에 띄우고 트래픽 전환. 무중단 배포의 핵심 |
+| **Terraform State** | tfstate 파일이 현재 인프라 상태를 추적. 원격 백엔드(S3)에 저장해야 팀 협업 가능 |
+| **NAT Gateway vs VPC Endpoint** | NAT는 인터넷 경유, VPC Endpoint는 AWS 내부 경유. S3 접근 시 비용 차이 큼 |
+| **ECS Task vs Service** | Task = 컨테이너 실행 단위, Service = Task를 관리하는 상위 개념 (desired count, LB 연결) |
+| **IAM Role vs User** | EC2/ECS에는 Role 부여 (임시 자격증명), 사람에게는 User (영구 자격증명) |
+| **Security Group vs NACL** | SG = 인스턴스 레벨 방화벽 (stateful), NACL = 서브넷 레벨 (stateless) |
 
 ---
 

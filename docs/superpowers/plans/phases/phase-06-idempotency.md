@@ -4,6 +4,9 @@
 
 **전제:** Phase 5 완료. CRUD + 캐시 + Redis 카운터가 동작하는 상태.
 
+**학습 키워드**
+`Idempotency` `Idempotency-Key Header` `SET NX (distributed lock)` `Exactly-once Delivery` `At-least-once vs At-most-once` `Retry with Exponential Backoff` `409 Conflict` `Starlette Middleware` `Network Partition`
+
 ---
 
 ## 학습: 멱등성이란
@@ -60,6 +63,16 @@ Headers: { Idempotency-Key: "client-generated-uuid" }
 ```
 
 **왜 이중인가:** Redis가 장애 나도 DB에서 방어. DB만 쓰면 매 요청마다 DB 조회 → 느림.
+
+### 심화 학습 — 더 깊이 파볼 키워드
+
+| 키워드 | 왜 알아야 하는지 |
+|--------|----------------|
+| **Exactly-once vs At-least-once** | 분산 시스템에서 메시지 전달 보장 수준. 멱등성은 at-least-once를 exactly-once처럼 만드는 기법 |
+| **Redlock (분산 락 알고리즘)** | Redis 단일 인스턴스 락의 한계. Redis 클러스터에서 안전한 락을 위한 알고리즘 |
+| **Exponential Backoff + Jitter** | 재시도 간격을 지수적으로 늘리되 랜덤 편차 추가. 동시 재시도 폭풍 방지 |
+| **Two-Phase Commit (2PC)** | 분산 트랜잭션의 고전적 해법. 왜 실무에서는 잘 안 쓰고 멱등성으로 대체하는지 |
+| **Outbox Pattern** | DB 트랜잭션 + 이벤트 발행을 원자적으로. 멱등성과 결합하면 강력한 패턴 |
 
 ---
 

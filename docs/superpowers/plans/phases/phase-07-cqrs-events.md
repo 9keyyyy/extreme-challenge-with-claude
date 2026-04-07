@@ -4,6 +4,9 @@
 
 **전제:** Phase 6 완료. CRUD + 캐시 + 카운터 + 멱등성이 모두 동작하는 상태.
 
+**학습 키워드**
+`CQRS` `Event-Driven Architecture` `Event Sourcing vs Event-Driven` `Redis Streams` `XADD/XREADGROUP` `Consumer Group` `Eventual Consistency` `Strong Consistency` `Back Pressure` `Dead Letter Queue` `Replication Lag`
+
 ---
 
 ## 학습: CQRS와 이벤트 버스
@@ -69,6 +72,17 @@ CQRS + 이벤트로 분리하면 "글 수정 → 즉시 조회 → 구버전이 
 - **PostgreSQL:** 단일 서버에서 Strong. Read Replica에서 읽으면 Eventual (replication lag)
 - **MySQL:** 동일. Semi-sync replication으로 lag 줄일 수 있지만 완전 제거는 불가
 - **MongoDB:** readConcern "majority" = Strong, "local" = Eventual. 유연하게 선택 가능
+
+### 심화 학습 — 더 깊이 파볼 키워드
+
+| 키워드 | 왜 알아야 하는지 |
+|--------|----------------|
+| **Event Sourcing vs Event-Driven** | Event Sourcing = 상태를 이벤트 시퀀스로 저장. Event-Driven = 이벤트로 통신만. 전혀 다른 패턴 |
+| **Dead Letter Queue (DLQ)** | 처리 실패한 이벤트를 별도 저장. 재처리나 디버깅에 필수 |
+| **Back Pressure** | Consumer가 처리 못하는 속도로 이벤트가 쌓일 때 대응. Streams의 XLEN으로 모니터링 |
+| **Saga Pattern** | 여러 서비스 걸쳐 트랜잭션 관리. CQRS + Event와 자주 함께 사용 |
+| **Replication Lag** | Read Replica에서 읽을 때 발생하는 지연. Eventual Consistency의 실체 |
+| **XPENDING / XCLAIM** | 처리 안 된 메시지 확인 + 다른 Consumer에게 재할당. Consumer 장애 대응 |
 
 ---
 

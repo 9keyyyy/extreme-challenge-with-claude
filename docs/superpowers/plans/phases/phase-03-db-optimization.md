@@ -4,6 +4,9 @@
 
 **전제:** Phase 2 완료. 100만 데이터가 있고, OFFSET의 느림을 체감한 상태.
 
+**학습 키워드**
+`B-tree Index` `Clustered vs Heap Table` `Index Scan vs Seq Scan` `Covering Index` `Partial Index` `Expression Index` `Cursor Pagination` `Keyset Pagination` `EXPLAIN ANALYZE` `Index Selectivity`
+
 ---
 
 ## 학습: 인덱스와 커서 페이지네이션
@@ -70,6 +73,17 @@ Execution Time: 0.18 ms  ← 실제 소요 시간
 - `Index Scan` → 인덱스 사용. 빠름.
 - `actual time` → 실제 소요 시간 (ms)
 - `rows` → 실제 처리한 행 수
+
+### 심화 학습 — 더 깊이 파볼 키워드
+
+| 키워드 | 왜 알아야 하는지 |
+|--------|----------------|
+| **Index Selectivity** | 인덱스가 얼마나 효과적인지의 지표. `gender` (2종류)보다 `email` (고유)이 selectivity 높음 |
+| **Covering Index (Index-Only Scan)** | 인덱스만으로 쿼리 결과를 반환. 테이블 접근 0. PG에서는 INCLUDE 절로 구현 |
+| **Partial Index** | `WHERE is_deleted = false` 조건부 인덱스. 활성 데이터만 인덱싱해서 크기 줄임. PG 전용 기능 |
+| **BRIN Index** | 시계열 데이터에 특화. B-tree보다 100배 작은 크기. created_at 같은 순차 데이터에 적합 |
+| **pg_stat_statements** | 실행된 쿼리별 통계 (평균 시간, 호출 횟수). 느린 쿼리 Top 10 찾는 도구 |
+| **Deferred Constraints** | 트랜잭션 끝에서 제약조건 검사. 순환 참조나 벌크 INSERT에서 유용 |
 
 ---
 

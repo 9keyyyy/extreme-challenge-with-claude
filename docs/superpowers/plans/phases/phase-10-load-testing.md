@@ -4,6 +4,9 @@
 
 **전제:** Phase 9 완료. 모니터링 스택이 동작하는 상태.
 
+**학습 키워드**
+`Smoke/Load/Stress/Spike/Soak Test` `k6 (Go-based)` `Virtual Users (VU)` `RPS vs Latency` `Little's Law` `Coordinated Omission` `Amdahl's Law` `Think Time` `Ramp-up/Ramp-down` `Threshold` `Saturation Point`
+
 ---
 
 ## 학습: 부하 테스트의 종류와 목적
@@ -48,6 +51,17 @@ http_reqs.....................: 15000  750/s
 1. **워밍업 없이 바로 풀 트래픽:** 커넥션 풀, JIT, 캐시가 안 채워진 상태에서 테스트하면 결과가 왜곡됨
 2. **테스트 데이터 부족:** 게시글 10개로 테스트하면 DB 캐시에 다 올라가서 실제와 다름
 3. **단일 엔드포인트만 테스트:** 실제로는 읽기 99% + 쓰기 1% 혼합 트래픽
+
+### 심화 학습 — 더 깊이 파볼 키워드
+
+| 키워드 | 왜 알아야 하는지 |
+|--------|----------------|
+| **Little's Law** | L = λW (동시 사용자 = 도착률 × 체류시간). VU와 RPS 관계를 수학적으로 이해 |
+| **Coordinated Omission** | 부하 도구가 느린 응답을 기다리면서 실제보다 좋은 결과를 보여주는 현상. k6는 이 문제가 적음 |
+| **Amdahl's Law** | 병렬화 한계. 10%가 직렬이면 아무리 스케일아웃해도 10배가 최대 |
+| **Throughput vs Latency** | RPS를 높이면 latency도 올라감. 둘의 트레이드오프를 이해해야 SLO 설정 가능 |
+| **Connection Pool Saturation** | DB/Redis 커넥션 풀이 고갈되면 대기 큐가 쌓이면서 latency가 급증하는 현상 |
+| **Tail Latency Amplification** | 마이크로서비스에서 fan-out 요청 시 하나라도 느리면 전체가 느려지는 현상 |
 
 ---
 
