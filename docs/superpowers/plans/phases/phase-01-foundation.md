@@ -11,6 +11,10 @@
 
 ### FastAPI — 왜 FastAPI인가?
 
+**핵심 질문: "왜 Django가 아니라 FastAPI를 썼나요?"**
+
+극한 트래픽 처리에서 가장 중요한 건 **I/O 대기 시간을 낭비하지 않는 것**. 웹 서버가 하는 일의 대부분은 DB 응답 기다리기, Redis 응답 기다리기, 외부 API 응답 기다리기임. 이 "기다리는 시간"에 다른 요청을 처리할 수 있느냐가 성능을 결정함.
+
 | 기준 | FastAPI | Django REST | Flask | Express (Node) |
 |------|---------|-------------|-------|----------------|
 | 비동기 지원 | 네이티브 async/await | 3.1+ 부분 지원 | 별도 확장 필요 | 네이티브 |
@@ -19,24 +23,35 @@
 | API 문서 | Swagger/ReDoc 자동 | DRF browsable API | 수동 | 수동 |
 | 학습 곡선 | 낮음 | 높음 (ORM, admin 등) | 낮음 | 낮음 |
 
-**선택 이유:** 극한 트래픽에서 async가 핵심. FastAPI는 Python 최고 성능의 비동기 프레임워크이고, Pydantic으로 타입 안전성도 자동 보장됨. Django는 기능이 많지만 비동기 지원이 아직 불완전하고 불필요한 오버헤드가 큼. Flask는 비동기가 네이티브가 아님.
+Django는 admin, auth, ORM 등 풀스택 기능이 강점이지만, 이 프로젝트는 API 서버만 필요하고 비동기가 핵심이라 오히려 오버헤드가 됨. Flask는 가볍지만 비동기가 네이티브가 아니라 gevent/eventlet 같은 monkey-patching이 필요하고, 이건 디버깅이 악몽임.
 
-**핵심 개념 — async/await:**
+**핵심 개념 — ASGI와 async/await가 성능에 미치는 영향:**
+
 ```python
-# 동기: 한 번에 하나씩 처리
+# WSGI (동기): 한 번에 하나씩 처리
 def get_post(id):
-    post = db.query(id)      # DB 응답 기다리는 동안 아무것도 못 함
+    post = db.query(id)      # DB 응답 기다리는 동안 이 스레드는 아무것도 못 함
     return post
 
-# 비동기: 기다리는 동안 다른 요청 처리
+# ASGI (비동기): 기다리는 동안 다른 요청 처리
 async def get_post(id):
     post = await db.query(id)  # DB 기다리는 동안 다른 요청 처리 가능
     return post
 ```
-동기 서버: 1000 동시 요청 → 1000 스레드 필요 (메모리 폭발)
-비동기 서버: 1000 동시 요청 → 이벤트 루프 1개로 처리 (I/O 대기 시간 활용)
+
+동기 서버가 1000명을 동시에 처리하려면 1000개의 스레드가 필요함. 스레드 1개당 ~1MB 메모리니까 1000개 = 1GB. 이게 10만이 되면? 불가능함.
+
+비동기 서버는 이벤트 루프 1개로 수천 개의 동시 요청을 처리함. DB 응답을 기다리는 동안 다른 요청의 코드를 실행하는 구조. 스레드 전환 오버헤드도 없음.
+
+**프로덕션에서의 차이:**
+- WSGI(gunicorn) 워커 4개 = 동시 4개 요청 처리 (나머지는 큐에서 대기)
+- ASGI(uvicorn) 워커 4개 = 동시 수천 개 요청 처리 (I/O 대기 시간 활용)
 
 ### SQLAlchemy 2.0 (async) — 왜 SQLAlchemy인가?
+
+**핵심 질문: "ORM을 쓰면 성능이 떨어지지 않나요?"**
+
+맞는 말이긴 한데, 정확히는 "ORM의 추상화 레벨이 높을수록 생성되는 SQL을 제어하기 어려워진다"가 정확한 표현임. SQLAlchemy 2.0은 이 문제를 해결하는 독특한 위치에 있음.
 
 | 기준 | SQLAlchemy 2.0 | Django ORM | Tortoise ORM | 직접 SQL (asyncpg) |
 |------|---------------|------------|--------------|-------------------|
@@ -45,22 +60,39 @@ async def get_post(id):
 | 마이그레이션 | Alembic | Django migrations | Aerich | 직접 관리 |
 | 성능 제어 | 세밀한 쿼리 제어 | 추상화 높음 | 중간 | 최고 (raw SQL) |
 
-**선택 이유:** async 네이티브 + 20년 검증된 안정성 + 세밀한 쿼리 제어. 극한 상황에서는 ORM이 생성하는 SQL을 정확히 제어할 수 있어야 함. Tortoise는 아직 생태계가 작음.
+SQLAlchemy는 "Core"와 "ORM" 두 레이어로 나뉨. Core는 SQL 빌더에 가까워서 생성되는 SQL을 정확히 제어 가능하고, ORM은 편의 기능을 제공함. 극한 상황에서 ORM이 생성하는 쿼리가 비효율적이면 Core 레벨로 내려가서 직접 최적화할 수 있음. Django ORM은 이런 유연성이 부족함.
+
+asyncpg를 직접 쓰면 성능은 최고지만, 마이그레이션 관리, 모델 정의, 쿼리 빌딩을 전부 수동으로 해야 함. 생산성과 성능 사이의 최적 지점이 SQLAlchemy 2.0임.
+
+### Connection Pool — 왜 커넥션을 미리 만들어두는가?
+
+**핵심 질문: "Connection Pool이 뭐고 왜 필요한가요?"**
+
+DB 연결 1번 = TCP handshake + TLS 협상 + 인증 = ~50ms. 매 요청마다 연결/해제하면 API 응답 시간에 50ms가 추가됨. 1000 RPS면 초당 1000번 연결/해제 = DB 서버에 연결 관리 부하만으로 과부하.
+
+Connection Pool은 연결을 미리 만들어두고 재사용하는 것. `pool_size=5`면 항상 5개 연결을 유지하고, 요청이 오면 풀에서 꺼내 쓰고 반환함.
+
+```
+pool_size=5     → 항상 5개 연결 유지
+max_overflow=10 → 부하 시 최대 15개까지 확장
+→ 16번째 동시 요청은 대기 (이게 나중에 병목이 됨!)
+```
+
+**안 쓰면 뭐가 터지나:** RDS의 max_connections 기본값은 ~100. 서버 3대 × 요청당 연결 = 순식간에 "too many connections" 에러. Pool이 이걸 방지함.
 
 ### Docker Compose — 왜 Docker인가?
 
-로컬에서 PostgreSQL + Redis + MinIO + 모니터링을 한 번에 띄울 수 있음. "내 컴퓨터에서는 되는데..." 방지. 클라우드 배포 시에도 같은 컨테이너 이미지 사용 가능.
+로컬에서 PostgreSQL + Redis + MinIO + 모니터링을 `docker compose up` 한 줄로 띄울 수 있음. "내 컴퓨터에서는 되는데..." 문제를 원천 차단하고, 개발 환경과 프로덕션 환경의 차이를 최소화함. 클라우드 배포 시에도 같은 컨테이너 이미지를 그대로 사용.
 
-### 심화 학습 — 더 깊이 파볼 키워드
+### 심화 학습
 
 | 키워드 | 왜 알아야 하는지 |
 |--------|----------------|
-| **ASGI vs WSGI** | FastAPI는 ASGI 기반. Django/Flask는 WSGI. 비동기 처리 방식의 근본적 차이 |
-| **uvicorn vs gunicorn** | ASGI 서버(uvicorn)와 WSGI 서버(gunicorn)의 차이. 프로덕션에서는 gunicorn + uvicorn worker 조합을 쓰는 이유 |
-| **UUID vs Auto-increment PK** | 분산 환경에서 auto-increment는 충돌 위험. UUID는 어디서든 생성 가능하지만 인덱스 성능에 영향 |
-| **Pydantic v2 내부 동작** | Rust 기반 검증 엔진으로 v1 대비 5-50배 빠름. model_dump, model_validate 동작 원리 |
-| **SQLAlchemy 2.0 스타일** | 1.x의 legacy query vs 2.0의 select() 스타일 차이. mapped_column이 Column을 대체한 이유 |
-| **Alembic autogenerate 한계** | 인덱스명 변경, 데이터 마이그레이션은 자동 감지 못 함. 수동 마이그레이션이 필요한 경우 |
+| **ASGI vs WSGI** | WSGI는 요청-응답 사이클이 동기적. ASGI는 비동기 + WebSocket 지원. FastAPI가 빠른 근본적 이유 |
+| **uvicorn vs gunicorn** | 프로덕션에서는 gunicorn이 uvicorn 워커를 관리하는 구조 (`gunicorn -k uvicorn.workers.UvicornWorker`). 이유: gunicorn이 프로세스 관리(재시작, 헬스체크)에 강함 |
+| **UUID vs Auto-increment PK** | Auto-increment는 DB 1대에서만 유일성 보장. 서버 여러 대에서 동시 INSERT하면 충돌 위험. UUID는 어디서든 생성해도 충돌 확률이 사실상 0이지만, 랜덤 UUID는 B-tree 인덱스에서 페이지 분할을 유발해서 INSERT 성능이 떨어짐. UUIDv7(시간 순서)이 대안 |
+| **Pydantic v2** | Rust 기반 검증 엔진으로 v1 대비 5-50배 빠름. 극한 트래픽에서 요청 파싱/검증 비용이 무시 못 할 수준이 되면 이 차이가 체감됨 |
+| **SQLAlchemy 2.0 스타일** | 1.x의 `session.query(Model).filter()` → 2.0의 `select(Model).where()`. 2.0 스타일이 async와 호환되고, 타입 힌트 지원이 나음 |
 
 ---
 

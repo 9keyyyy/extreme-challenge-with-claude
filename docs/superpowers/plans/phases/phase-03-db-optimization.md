@@ -11,79 +11,100 @@
 
 ## 학습: 인덱스와 커서 페이지네이션
 
-### 인덱스란?
+Phase 2에서 확인한 병목: OFFSET 느림, COUNT(*) 비쌈, 조회수 UPDATE 경합. 이 Phase에서는 앞의 두 가지를 해결함. (조회수는 Phase 5에서 Redis로 해결.)
 
-인덱스 없이 "created_at으로 정렬된 최신 20개"를 찾으려면?
-→ 100만 개를 전부 읽고 정렬해서 20개 반환. 이게 **Seq Scan(순차 스캔)**.
+### 인덱스 — "DB 성능 튜닝의 80%는 인덱스"
 
-인덱스는 "이미 정렬된 목차"를 별도로 만들어두는 것.
-→ 목차에서 바로 최신 20개 위치를 찾아서 반환. 이게 **Index Scan**.
+**핵심 질문: "인덱스가 어떻게 동작하는지 설명해주세요. 아무 컬럼에나 다 걸면 좋나요?"**
+
+인덱스 없이 "created_at으로 정렬된 최신 20개"를 찾으려면 100만 개를 전부 읽고 정렬해서 20개를 반환해야 함. 이게 Seq Scan. 인덱스는 "이미 정렬된 별도 자료구조(B-tree)"를 만들어두는 것. 목차에서 바로 원하는 위치로 점프할 수 있음.
 
 ```
 Seq Scan:   [1] [2] [3] ... [999,999] [1,000,000] → 전부 읽음
-Index Scan: 목차 → [1,000,000] [999,999] ... [999,981] → 20개만 읽음
+Index Scan: B-tree 목차 → [1,000,000] → [999,999] → ... → [999,981] → 20개만 읽음
 ```
 
-**DB별 인덱스 비교:**
+**인덱스를 아무 데나 걸면 안 되는 이유:**
+- 인덱스 = 별도 자료구조 = **디스크 공간 추가 사용**. 100만 row 테이블에 인덱스 5개면 테이블보다 인덱스가 더 클 수 있음
+- INSERT/UPDATE/DELETE마다 **인덱스도 같이 갱신**해야 함. 인덱스가 많을수록 쓰기가 느려짐
+- 읽기 99% / 쓰기 1% 게시판에서는 인덱스가 유리하지만, 쓰기 비율이 높은 시스템(채팅, 로그)에서는 오히려 해가 될 수 있음
+
+**어떤 컬럼에 인덱스를 거는가:**
+- WHERE 절에 자주 쓰이는 컬럼 (`created_at`, `author`)
+- ORDER BY에 쓰이는 컬럼 (`created_at DESC`)
+- JOIN 조건 컬럼 (`post_id`)
+- Selectivity가 높은 컬럼 (고유한 값이 많은 컬럼). `gender` (2종류)에 인덱스 거는 건 낭비, `email` (유일)은 효과적
+
+**DB별 인덱스 구조 차이 — 이 차이를 알면 DB 선택 근거가 명확해짐:**
 
 | 기준 | PostgreSQL | MySQL (InnoDB) | MongoDB |
 |------|-----------|----------------|---------|
 | 기본 인덱스 구조 | B-tree | B+tree (클러스터드) | B-tree |
-| 클러스터드 인덱스 | 없음 (heap table) | PK가 클러스터드 인덱스 | _id가 클러스터드 |
+| 데이터 저장 방식 | Heap table (데이터와 인덱스 분리) | PK가 클러스터드 인덱스 (데이터가 PK 순서로 정렬) | _id가 클러스터드 |
 | 커버링 인덱스 | Index-Only Scan | Using index | Covered query |
 | 부분 인덱스 | `WHERE active = true` 지원 | 미지원 | Partial index 지원 |
 | 표현식 인덱스 | `lower(email)` 가능 | Generated column 필요 | 미지원 |
 
-**PostgreSQL의 특징:**
-- Heap table (데이터와 인덱스가 별도) → 인덱스가 행 위치(ctid)를 가리킴
-- MySQL은 PK 순서로 데이터가 물리적으로 정렬됨 (클러스터드) → PK 범위 조회가 빠름
-- PostgreSQL은 물리적 정렬이 없음 → 대신 BRIN 인덱스로 범위 조회 최적화 가능
+**PostgreSQL vs MySQL의 핵심 차이:**
+- MySQL InnoDB는 PK가 클러스터드 인덱스. 데이터가 PK 순서로 물리적으로 정렬되어 있음. PK 범위 조회(`WHERE id BETWEEN 100 AND 200`)가 디스크에서 연속 읽기라 매우 빠름
+- PostgreSQL은 Heap table. 데이터가 삽입 순서로 쌓이고, 인덱스는 행의 물리적 위치(ctid)를 가리킴. 인덱스를 통한 접근에서 "random I/O"가 발생할 수 있어서 대량 조회에서 MySQL보다 불리할 수 있음
+- 대신 PG는 부분 인덱스(`WHERE is_deleted = false`만 인덱싱)나 표현식 인덱스(`lower(email)`)를 지원해서 더 정밀한 최적화가 가능함
 
-### 커서 페이지네이션 vs OFFSET
+### 커서 페이지네이션 — OFFSET의 근본적 해결
+
+**핵심 질문: "커서 기반 페이지네이션이 OFFSET보다 왜 좋은가요? 단점은 없나요?"**
 
 ```sql
--- OFFSET: N개를 건너뛰어야 해서 느림
+-- OFFSET: "999,980개 건너뛰고 20개 줘" → DB가 999,980개를 세면서 이동
 SELECT * FROM posts ORDER BY created_at DESC LIMIT 20 OFFSET 999980;
 
--- 커서: "이 시점 이전" 조건으로 인덱스를 타서 빠름
+-- 커서: "이 시점 이전 20개 줘" → 인덱스에서 해당 시점으로 바로 점프
 SELECT * FROM posts WHERE created_at < '2025-01-01' ORDER BY created_at DESC LIMIT 20;
 ```
 
+커서가 빠른 이유: B-tree 인덱스에서 `'2025-01-01'`을 찾는 건 O(log N)이고, 거기서 20개를 읽는 건 O(20). 데이터가 100만이든 1억이든 **항상 일정한 시간**.
+
 | 기준 | OFFSET | 커서 |
 |------|--------|------|
-| 뒤쪽 페이지 성능 | O(N) — 느려짐 | O(1) — 일정 |
-| "N페이지로 점프" | 가능 | 불가능 |
-| 실시간 데이터 추가 | 중복/누락 발생 | 안정적 |
-| 구현 난이도 | 쉬움 | 약간 복잡 |
+| 뒤쪽 페이지 성능 | O(N) — 데이터 많을수록 느림 | O(log N + K) — 항상 일정 |
+| "N페이지로 점프" | 가능 | 불가능 (순차만) |
+| 실시간 데이터 추가 | 중복/누락 발생 가능 | 안정적 |
+| COUNT(*) 필요 여부 | 총 페이지 수 계산에 필요 | 불필요 (`has_more` 플래그) |
 
-**결론:** 커뮤니티 게시판에서 "50000페이지로 점프"하는 유저는 없음. 무한 스크롤/더보기가 자연스러움 → 커서가 적합함.
+**커서의 단점:** "37페이지로 바로 이동" 같은 기능이 불가능함. 대신 현대 UI에서 게시판은 무한스크롤/더보기 방식이 대세라서, 이 제약이 실제로 문제가 되는 경우는 거의 없음. Google, Twitter, Instagram 전부 커서 기반임.
 
-### EXPLAIN ANALYZE 읽는 법
+**OFFSET을 쓰면서도 성능을 개선하는 방법:** 없는 건 아님. "Deferred JOIN" 패턴(`SELECT * FROM posts WHERE id IN (SELECT id FROM posts ORDER BY created_at LIMIT 20 OFFSET 999980)`)으로 서브쿼리에서 PK만 먼저 찾고 본 데이터를 조회하면 약간 나아지지만, 근본적 해결은 아님.
+
+### EXPLAIN ANALYZE — 쿼리가 느린 이유를 찾는 도구
+
+**핵심 질문: "슬로우 쿼리 발견했을 때 어떻게 대응하셨나요?"**
 
 ```
 Limit  (cost=0.42..1.23 rows=20 width=200) (actual time=0.05..0.12 rows=20 loops=1)
-  ->  Index Scan Backward using ix_posts_created_at on posts  ← 인덱스 사용!
+  ->  Index Scan Backward using ix_posts_created_at on posts
         (actual time=0.04..0.10 rows=20 loops=1)
 Planning Time: 0.15 ms
-Execution Time: 0.18 ms  ← 실제 소요 시간
+Execution Time: 0.18 ms
 ```
 
-핵심 확인 포인트:
-- `Seq Scan` → 인덱스 안 탐. 풀스캔.
-- `Index Scan` → 인덱스 사용. 빠름.
-- `actual time` → 실제 소요 시간 (ms)
-- `rows` → 실제 처리한 행 수
+읽는 법:
+- `Seq Scan` → 인덱스 안 타고 풀스캔. 대부분 느림의 원인
+- `Index Scan` → 인덱스 사용. 좋은 신호
+- `Index Scan Backward` → 인덱스를 역순으로 탐색. `ORDER BY DESC`에 대응
+- `actual time=0.04..0.10` → 첫 행까지 0.04ms, 마지막 행까지 0.10ms
+- `rows=20` → 실제 처리한 행 수. 예상(rows 앞 숫자)과 실제가 크게 다르면 통계가 부정확하다는 신호 → `ANALYZE` 실행 필요
 
-### 심화 학습 — 더 깊이 파볼 키워드
+**cost vs actual time:** cost는 PG의 예상 비용(상대값), actual time은 실제 소요 시간(ms). 최적화할 때는 actual time을 봐야 함.
+
+### 심화 학습
 
 | 키워드 | 왜 알아야 하는지 |
 |--------|----------------|
-| **Index Selectivity** | 인덱스가 얼마나 효과적인지의 지표. `gender` (2종류)보다 `email` (고유)이 selectivity 높음 |
-| **Covering Index (Index-Only Scan)** | 인덱스만으로 쿼리 결과를 반환. 테이블 접근 0. PG에서는 INCLUDE 절로 구현 |
-| **Partial Index** | `WHERE is_deleted = false` 조건부 인덱스. 활성 데이터만 인덱싱해서 크기 줄임. PG 전용 기능 |
-| **BRIN Index** | 시계열 데이터에 특화. B-tree보다 100배 작은 크기. created_at 같은 순차 데이터에 적합 |
-| **pg_stat_statements** | 실행된 쿼리별 통계 (평균 시간, 호출 횟수). 느린 쿼리 Top 10 찾는 도구 |
-| **Deferred Constraints** | 트랜잭션 끝에서 제약조건 검사. 순환 참조나 벌크 INSERT에서 유용 |
+| **Covering Index (Index-Only Scan)** | 테이블에 접근하지 않고 인덱스만으로 결과 반환. `SELECT id, created_at`만 필요하면 해당 컬럼만 있는 인덱스로 I/O를 대폭 줄일 수 있음 |
+| **Partial Index** | `CREATE INDEX ON posts(created_at) WHERE is_deleted = false` — 활성 데이터만 인덱싱. 인덱스 크기 줄이고 쓰기 오버헤드 줄임. PG의 강력한 기능 |
+| **BRIN Index** | Block Range INdex. 시계열 데이터(로그, 게시글)에서 B-tree 대비 100배 작은 크기. 단점: 정확도가 낮아서 많은 row를 재검사해야 할 수 있음 |
+| **pg_stat_statements** | 실행된 모든 쿼리의 통계(총 시간, 평균 시간, 호출 횟수). `ORDER BY total_time DESC`로 가장 비싼 쿼리 Top 10을 찾는 게 성능 튜닝의 출발점 |
+| **Query Planner와 Statistics** | PG가 쿼리 플랜을 선택하는 기준. `pg_stats`의 통계가 부정확하면 잘못된 플랜을 선택함. `ANALYZE` 명령으로 통계 갱신 |
 
 ---
 
