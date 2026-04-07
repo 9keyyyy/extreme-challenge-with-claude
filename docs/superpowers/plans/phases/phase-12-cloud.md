@@ -1,0 +1,533 @@
+# Phase 12: 클라우드 배포 — AWS ECS Fargate + Terraform
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans
+
+**전제:** Phase 11 완료. 로컬에서 모든 기능 + 부하 + 장애 테스트 완료 상태.
+
+---
+
+## 학습: 컨테이너 오케스트레이션
+
+### ECS Fargate vs EKS vs EC2 직접 배포
+
+| | ECS Fargate | EKS (Kubernetes) | EC2 직접 |
+|---|---|---|---|
+| 서버 관리 | 없음 (서버리스) | 노드 관리 필요 | 전부 직접 |
+| 스케일링 | 자동 (태스크 단위) | 자동 (Pod 단위) | 수동 또는 ASG |
+| 최소 비용 | ~$15/월 | ~$73/월 (컨트롤 플레인) | ~$8/월 (t3.micro) |
+| 학습 곡선 | 낮음 | 매우 높음 | 중간 |
+| 운영 복잡도 | 낮음 | 높음 | 중간 |
+
+**ECS Fargate 선택 이유:**
+- $100 예산에서 EKS 컨트롤 플레인($73)만으로 예산 초과
+- EC2는 서버 패치, 보안 업데이트 직접 해야 함
+- Fargate는 사용한 만큼만 과금 + 서버 관리 0
+
+### Terraform — 왜 IaC(Infrastructure as Code)인가
+
+| | Terraform | CloudFormation | Pulumi | CDK |
+|---|---|---|---|---|
+| 클라우드 | 멀티 | AWS만 | 멀티 | AWS 중심 |
+| 언어 | HCL | JSON/YAML | TypeScript/Python | TypeScript/Python |
+| 상태 관리 | tfstate 파일 | AWS 관리 | 클라우드 관리 | AWS 관리 |
+| 드리프트 감지 | `terraform plan` | 제한적 | 있음 | 제한적 |
+
+**Terraform 선택 이유:**
+- 멀티클라우드 경험이 이력서에 강점
+- `terraform plan`으로 변경사항 미리 확인 가능 = 실수 방지
+- 커뮤니티 모듈이 풍부
+
+### 아키텍처 다이어그램
+
+```
+Internet
+  │
+  ├── ALB (Application Load Balancer)
+  │     ├── Target: ECS Service (App × 2 tasks)
+  │     └── Health Check: /health
+  │
+  ├── ECS Fargate
+  │     ├── App Task (FastAPI)
+  │     ├── Event Consumer Task
+  │     └── Counter Sync Task
+  │
+  ├── RDS PostgreSQL (db.t3.micro)
+  │     └── Multi-AZ: 아님 (비용 절감)
+  │
+  ├── ElastiCache Redis (cache.t3.micro)
+  │     └── 클러스터 모드: 아님 (비용 절감)
+  │
+  └── S3
+        ├── tmp/ (Lifecycle: 24시간 자동 삭제)
+        └── images/ (영구 보관)
+```
+
+### 비용 예측 (월 기준)
+
+| 서비스 | 사양 | 예상 비용 |
+|--------|------|----------|
+| ECS Fargate | 0.25 vCPU, 0.5GB × 3 tasks | ~$10 |
+| RDS PostgreSQL | db.t3.micro | ~$15 |
+| ElastiCache Redis | cache.t3.micro | ~$13 |
+| ALB | 1개 | ~$16 |
+| S3 | 10GB 이하 | ~$1 |
+| ECR | 이미지 저장소 | ~$1 |
+| **합계** | | **~$56** |
+
+Free Tier 적용 시 더 낮아질 수 있음. $100 예산 내 충분.
+
+---
+
+## 구현
+
+### Task 20: Terraform 인프라 구성
+
+**Files:**
+- Create: `infra/main.tf`
+- Create: `infra/variables.tf`
+- Create: `infra/vpc.tf`
+- Create: `infra/ecs.tf`
+- Create: `infra/rds.tf`
+- Create: `infra/redis.tf`
+- Create: `infra/alb.tf`
+- Create: `infra/s3.tf`
+- Create: `infra/outputs.tf`
+
+- [ ] **Step 1: Terraform 초기 설정 + 변수**
+
+```hcl
+# infra/main.tf
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+```
+
+```hcl
+# infra/variables.tf
+variable "aws_region" {
+  default = "ap-northeast-2"  # 서울 리전
+}
+
+variable "project_name" {
+  default = "extreme-board"
+}
+
+variable "db_password" {
+  type      = string
+  sensitive = true
+}
+
+variable "app_image" {
+  description = "ECR 이미지 URI"
+  type        = string
+}
+```
+
+- [ ] **Step 2: VPC 구성**
+
+```hcl
+# infra/vpc.tf
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = "${var.project_name}-vpc"
+  cidr = "10.0.0.0/16"
+
+  azs             = ["${var.aws_region}a", "${var.aws_region}c"]
+  private_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
+  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24"]
+
+  enable_nat_gateway = true
+  single_nat_gateway = true  # 비용 절감: NAT 1개만
+
+  tags = {
+    Project = var.project_name
+  }
+}
+```
+
+- [ ] **Step 3: RDS PostgreSQL**
+
+```hcl
+# infra/rds.tf
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.project_name}-db-subnet"
+  subnet_ids = module.vpc.private_subnets
+}
+
+resource "aws_security_group" "rds" {
+  name   = "${var.project_name}-rds-sg"
+  vpc_id = module.vpc.vpc_id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
+}
+
+resource "aws_db_instance" "main" {
+  identifier     = "${var.project_name}-db"
+  engine         = "postgres"
+  engine_version = "16"
+  instance_class = "db.t3.micro"
+
+  allocated_storage     = 20
+  max_allocated_storage = 50  # 오토스케일링
+
+  db_name  = "extreme_board"
+  username = "postgres"
+  password = var.db_password
+
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+
+  skip_final_snapshot = true  # 개발용. 프로덕션에서는 false
+
+  tags = {
+    Project = var.project_name
+  }
+}
+```
+
+- [ ] **Step 4: ElastiCache Redis**
+
+```hcl
+# infra/redis.tf
+resource "aws_elasticache_subnet_group" "main" {
+  name       = "${var.project_name}-redis-subnet"
+  subnet_ids = module.vpc.private_subnets
+}
+
+resource "aws_security_group" "redis" {
+  name   = "${var.project_name}-redis-sg"
+  vpc_id = module.vpc.vpc_id
+
+  ingress {
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
+}
+
+resource "aws_elasticache_cluster" "main" {
+  cluster_id           = "${var.project_name}-redis"
+  engine               = "redis"
+  engine_version       = "7.0"
+  node_type            = "cache.t3.micro"
+  num_cache_nodes      = 1
+  parameter_group_name = "default.redis7"
+
+  subnet_group_name  = aws_elasticache_subnet_group.main.name
+  security_group_ids = [aws_security_group.redis.id]
+
+  tags = {
+    Project = var.project_name
+  }
+}
+```
+
+- [ ] **Step 5: ALB + ECS**
+
+```hcl
+# infra/alb.tf
+resource "aws_security_group" "alb" {
+  name   = "${var.project_name}-alb-sg"
+  vpc_id = module.vpc.vpc_id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_lb" "main" {
+  name               = "${var.project_name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = module.vpc.public_subnets
+}
+
+resource "aws_lb_target_group" "app" {
+  name        = "${var.project_name}-tg"
+  port        = 8000
+  protocol    = "HTTP"
+  vpc_id      = module.vpc.vpc_id
+  target_type = "ip"
+
+  health_check {
+    path                = "/health"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    timeout             = 5
+    interval            = 30
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+}
+```
+
+```hcl
+# infra/ecs.tf
+resource "aws_security_group" "app" {
+  name   = "${var.project_name}-app-sg"
+  vpc_id = module.vpc.vpc_id
+
+  ingress {
+    from_port       = 8000
+    to_port         = 8000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_ecs_cluster" "main" {
+  name = "${var.project_name}-cluster"
+}
+
+resource "aws_ecs_task_definition" "app" {
+  family                   = "${var.project_name}-app"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "256"   # 0.25 vCPU
+  memory                   = "512"   # 0.5 GB
+  execution_role_arn       = aws_iam_role.ecs_execution.arn
+
+  container_definitions = jsonencode([{
+    name  = "app"
+    image = var.app_image
+    portMappings = [{
+      containerPort = 8000
+      protocol      = "tcp"
+    }]
+    environment = [
+      { name = "DATABASE_URL", value = "postgresql+asyncpg://postgres:${var.db_password}@${aws_db_instance.main.endpoint}/extreme_board" },
+      { name = "REDIS_URL", value = "redis://${aws_elasticache_cluster.main.cache_nodes[0].address}:6379" },
+      { name = "MINIO_ENDPOINT", value = "" },
+      { name = "S3_BUCKET", value = aws_s3_bucket.uploads.id },
+    ]
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = "/ecs/${var.project_name}"
+        "awslogs-region"        = var.aws_region
+        "awslogs-stream-prefix" = "app"
+      }
+    }
+  }])
+}
+
+resource "aws_ecs_service" "app" {
+  name            = "${var.project_name}-app"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.app.arn
+  desired_count   = 2
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = module.vpc.private_subnets
+    security_groups  = [aws_security_group.app.id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.app.arn
+    container_name   = "app"
+    container_port   = 8000
+  }
+}
+
+# IAM
+resource "aws_iam_role" "ecs_execution" {
+  name = "${var.project_name}-ecs-execution"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution" {
+  role       = aws_iam_role.ecs_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_cloudwatch_log_group" "ecs" {
+  name              = "/ecs/${var.project_name}"
+  retention_in_days = 7  # 비용 절감
+}
+```
+
+- [ ] **Step 6: S3 버킷**
+
+```hcl
+# infra/s3.tf
+resource "aws_s3_bucket" "uploads" {
+  bucket = "${var.project_name}-uploads-${random_id.suffix.hex}"
+}
+
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "uploads" {
+  bucket = aws_s3_bucket.uploads.id
+
+  rule {
+    id     = "cleanup-tmp"
+    status = "Enabled"
+
+    filter {
+      prefix = "tmp/"
+    }
+
+    expiration {
+      days = 1  # tmp/ 24시간 후 자동 삭제
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "uploads" {
+  bucket = aws_s3_bucket.uploads.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+```
+
+- [ ] **Step 7: Outputs**
+
+```hcl
+# infra/outputs.tf
+output "alb_dns" {
+  value = aws_lb.main.dns_name
+}
+
+output "rds_endpoint" {
+  value = aws_db_instance.main.endpoint
+}
+
+output "redis_endpoint" {
+  value = aws_elasticache_cluster.main.cache_nodes[0].address
+}
+
+output "s3_bucket" {
+  value = aws_s3_bucket.uploads.id
+}
+```
+
+- [ ] **Step 8: 배포**
+
+```bash
+cd infra
+
+# 초기화
+terraform init
+
+# 변경사항 확인 (실제 반영 전 미리보기)
+terraform plan -var="db_password=YOUR_SECURE_PASSWORD" -var="app_image=YOUR_ECR_URI"
+
+# 반영 (확인 후)
+terraform apply -var="db_password=YOUR_SECURE_PASSWORD" -var="app_image=YOUR_ECR_URI"
+```
+
+- [ ] **Step 9: 배포 후 확인**
+
+```bash
+# ALB DNS로 헬스체크
+ALB_DNS=$(terraform output -raw alb_dns)
+curl http://$ALB_DNS/health
+
+# 게시글 생성 테스트
+curl -X POST http://$ALB_DNS/api/posts \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Cloud Test","content":"Deployed!","author":"terraform"}'
+
+# k6 부하 테스트 (클라우드 대상)
+k6 run -e BASE_URL=http://$ALB_DNS loadtest/scenarios/mixed_load.js
+```
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add infra/
+git commit -m "feat: Terraform AWS infrastructure — ECS Fargate, RDS, ElastiCache, ALB, S3"
+```
+
+---
+
+### Task 21: 정리 (비용 초과 방지)
+
+- [ ] **Step 1: 테스트 끝나면 인프라 삭제**
+
+```bash
+cd infra
+terraform destroy -var="db_password=YOUR_PASSWORD" -var="app_image=YOUR_IMAGE"
+```
+
+**중요:** 테스트 후 반드시 `terraform destroy` 실행. 안 하면 매일 ~$2 과금됨.
+
+- [ ] **Step 2: 비용 알림 설정 (선택)**
+
+AWS Billing → Budgets에서 $50 알림 설정 권장. 예산의 절반에서 알림이 오면 대응 가능.
+
+---
+
+## Phase 12 완료 체크리스트
+
+- [ ] Terraform으로 전체 인프라 생성
+- [ ] ECS Fargate에서 앱 정상 동작 확인
+- [ ] ALB를 통한 외부 접근 확인
+- [ ] 클라우드 환경에서 k6 부하 테스트 실행
+- [ ] 로컬 vs 클라우드 성능 비교
+- [ ] `terraform destroy`로 인프라 정리
+
+**핵심 체감:**
+- `terraform plan` → 변경사항 미리 확인. 콘솔 클릭과 차원이 다른 안전성
+- 로컬에서 검증한 Docker 이미지가 그대로 클라우드에서 동작 = 컨테이너의 가치
+- $100 예산 내에서 프로덕션급 아키텍처 구성 가능
