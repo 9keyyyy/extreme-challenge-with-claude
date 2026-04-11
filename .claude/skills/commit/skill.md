@@ -1,7 +1,7 @@
 ---
 name: commit
 description: Convention-based commits. Use when the user asks to commit (e.g. "커밋해줘", "commit해줘", "변경사항 저장해줘").
-allowed-tools: Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(git stash:*), Bash(git pull:*), Bash(git checkout:*), Bash(git switch:*), Bash(git branch:*)
+allowed-tools: Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(git stash:*), Bash(git pull:*), Bash(git checkout:*), Bash(git switch:*), Bash(git branch:*), Bash(git symbolic-ref:*)
 ---
 
 # Commit - Convention-based Commits
