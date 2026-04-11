@@ -81,7 +81,7 @@ frontend/
 
 ## 벤치마크 기준값
 
-각 Phase에서 측정하여 `benchmarks/phase-XX.md` 에 기록:
+각 Phase에서 측정하여 `frontend/benchmarks/fe-phase-XX-*.md` 에 기록:
 
 | 지표 | 측정 도구 | 목표 (Phase 13 기준) |
 |------|-----------|---------------------|
