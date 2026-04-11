@@ -116,9 +116,9 @@ fix: reissue 시 Admin 상태 검증
 4. If not on the base branch, continue to Step 1
 
 ### Step 1: Sync with remote
-1. `git stash` to save current changes (only if there are changes)
+1. `git stash push --include-untracked` to save current changes, including untracked files (only if there are changes)
 2. `git pull --ff-only` to fast-forward to the latest remote commits
-3. `git stash pop` to re-apply changes
+3. `git stash pop` to re-apply changes; if it reports conflicts, resolve them before continuing
 
 ### Step 2~8: Execute commits
 1. Use the git context above to understand current changes
