@@ -1062,7 +1062,7 @@ export default async function EditPostPage({ params }: Props) {
 }
 ```
 
-> **주의**: msw는 브라우저에서만 동작한다. Server Component에서 `fetchPost`를 직접 호출하면 msw가 가로채지 않는다. FE-1에서는 수정 페이지를 Client Component로 래핑하는 방식 대신, `PostForm` 컴포넌트가 Client Component이므로 `mode="edit"`와 함께 초기 데이터를 props로 주입할 수 없다. 해결: `EditPostPage`를 Client Component로 전환하거나, 수정 폼에서 직접 fetch하도록 변경한다.
+> **주의**: msw는 브라우저 Service Worker 기반이라 브라우저에서 발생한 요청만 가로챈다. 따라서 Server Component에서 `fetchPost`를 직접 호출하면 FE-1의 기본 msw 설정으로는 인터셉트되지 않는다. 다만 `PostForm`이 Client Component라는 이유만으로 초기 데이터를 props로 주입할 수 없는 것은 아니다. Server Component에서 가져온 직렬화 가능한 데이터(plain object)는 `mode="edit"`와 함께 `post` props로 전달할 수 있다. 실제 제약은 "어디서 fetch가 실행되느냐"이다. 해결 방법은 (1) 서버에서도 모킹이 필요하면 `msw/node` 등으로 서버측 요청까지 모킹하거나, (2) FE-1에서는 edit 페이지 또는 수정 폼에서 클라이언트에서 직접 fetch하도록 구성하는 것이다.
 >
 > **FE-1에서의 실용적 접근**: `src/app/posts/[id]/edit/page.tsx`를 Client Component로 작성:
 
