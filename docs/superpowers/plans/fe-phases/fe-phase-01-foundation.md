@@ -675,7 +675,7 @@ export function PostList() {
   const [error, setError] = useState<string | null>(null);
 
   const pageSize = 20;
-  const totalPages = Math.ceil(total / pageSize);
+  const totalPages = total === 0 ? 1 : Math.ceil(total / pageSize);
 
   useEffect(() => {
     setLoading(true);
@@ -715,8 +715,10 @@ export function PostList() {
           {page} / {totalPages} 페이지 (총 {total.toLocaleString()}개)
         </span>
         <button
-          onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-          disabled={page === totalPages}
+          onClick={() =>
+            setPage((p) => (totalPages === 0 ? 1 : Math.min(totalPages, p + 1)))
+          }
+          disabled={totalPages === 0 || page >= totalPages}
           className="px-4 py-2 border rounded disabled:opacity-50"
         >
           다음
