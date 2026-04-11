@@ -64,18 +64,18 @@ frontend/
 | Phase | 설명 | 상세 계획 | 상태 |
 |-------|------|-----------|------|
 | **FE-1** | 프로젝트 셋업 + Naive UI | [fe-phase-01-foundation.md](fe-phases/fe-phase-01-foundation.md) | - |
-| **FE-2** | 렌더링 병목 체험 | [fe-phase-02-bottleneck.md](fe-phases/fe-phase-02-bottleneck.md) | - |
-| **FE-3** | 리스트 최적화 | [fe-phase-03-list-optimization.md](fe-phases/fe-phase-03-list-optimization.md) | - |
-| **FE-4** | 데이터 페칭 + 캐싱 | [fe-phase-04-caching.md](fe-phases/fe-phase-04-caching.md) | - |
-| **★ FE-5** | 대량 렌더링 극한 | [fe-phase-05-virtualization.md](fe-phases/fe-phase-05-virtualization.md) | - |
-| **FE-6** | 동시성 UI 패턴 | [fe-phase-06-concurrency.md](fe-phases/fe-phase-06-concurrency.md) | - |
-| **FE-7** | 상태 관리 + Smart Polling | [fe-phase-07-state-polling.md](fe-phases/fe-phase-07-state-polling.md) | - |
-| **FE-8** | 이미지 업로드 UX | [fe-phase-08-image-upload.md](fe-phases/fe-phase-08-image-upload.md) | - |
-| **★ FE-9** | 네트워크 극한 | [fe-phase-09-network.md](fe-phases/fe-phase-09-network.md) | - |
-| **FE-10** | 프론트엔드 모니터링 | [fe-phase-10-monitoring.md](fe-phases/fe-phase-10-monitoring.md) | - |
-| **FE-11** | 스트레스 테스트 | [fe-phase-11-stress.md](fe-phases/fe-phase-11-stress.md) | - |
-| **★ FE-12** | 메모리/성능 극한 | [fe-phase-12-memory.md](fe-phases/fe-phase-12-memory.md) | - |
-| **FE-13** | 프로덕션 배포 + CDN | [fe-phase-13-deploy.md](fe-phases/fe-phase-13-deploy.md) | - |
+| **FE-2** | 렌더링 병목 체험 | `fe-phase-02-bottleneck.md` (상세 계획 PR 예정) | - |
+| **FE-3** | 리스트 최적화 | `fe-phase-03-list-optimization.md` (상세 계획 PR 예정) | - |
+| **FE-4** | 데이터 페칭 + 캐싱 | `fe-phase-04-caching.md` (상세 계획 PR 예정) | - |
+| **★ FE-5** | 대량 렌더링 극한 | `fe-phase-05-virtualization.md` (상세 계획 PR 예정) | - |
+| **FE-6** | 동시성 UI 패턴 | `fe-phase-06-concurrency.md` (상세 계획 PR 예정) | - |
+| **FE-7** | 상태 관리 + Smart Polling | `fe-phase-07-state-polling.md` (상세 계획 PR 예정) | - |
+| **FE-8** | 이미지 업로드 UX | `fe-phase-08-image-upload.md` (상세 계획 PR 예정) | - |
+| **★ FE-9** | 네트워크 극한 | `fe-phase-09-network.md` (상세 계획 PR 예정) | - |
+| **FE-10** | 프론트엔드 모니터링 | `fe-phase-10-monitoring.md` (상세 계획 PR 예정) | - |
+| **FE-11** | 스트레스 테스트 | `fe-phase-11-stress.md` (상세 계획 PR 예정) | - |
+| **★ FE-12** | 메모리/성능 극한 | `fe-phase-12-memory.md` (상세 계획 PR 예정) | - |
+| **FE-13** | 프로덕션 배포 + CDN | `fe-phase-13-deploy.md` (상세 계획 PR 예정) | - |
 
 ---
 
