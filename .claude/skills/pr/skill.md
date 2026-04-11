@@ -94,7 +94,10 @@ Closes #{issue-number}   ← issue-number가 있을 때만 포함
 ### Step 1: Analyze
 - 위 git context를 바탕으로 변경 내용 파악
 - 필요 시 변경된 파일 직접 읽어 context 보완
-- PR 제목(한국어, 명령문, 50자 이내)과 body 초안 작성
+- PR 제목과 body 초안 작성
+  - 제목 형식: `type: 한국어 요약` (50자 이내, 명령문, 끝 마침표 없음)
+  - type은 커밋 컨벤션과 동일: feat / fix / refactor / style / chore / test / docs
+  - 브랜치의 커밋들을 종합해 가장 대표적인 type 하나 선택
 
 ### Step 2: Preview & confirm
 다음을 사용자에게 보여주고 승인 대기:
