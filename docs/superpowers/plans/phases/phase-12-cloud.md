@@ -176,6 +176,8 @@ Free Tier 적용 시 더 낮아질 수 있음. $100 예산 내 충분.
 
 ## 구현
 
+> **TDD 참고:** 이 Phase는 Terraform IaC + 배포. `terraform plan`/`terraform validate`로 검증.
+
 ### Task 20: Terraform 인프라 구성
 
 **Files:**

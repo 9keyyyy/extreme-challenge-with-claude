@@ -141,7 +141,11 @@ Redis NX(SET if Not eXists) 는 원자적 연산임. "없으면 SET하고 성공
 
 ---
 
-## 구현
+## 구현 (TDD)
+
+개발 방식: **테스트 먼저 작성 (RED)** → **최소 구현 (GREEN)** → **리팩토링 (REFACTOR)**
+
+> Task 13이 이미 TDD 흐름 — 중복 생성 테스트(RED) 먼저 작성 후, Task 14에서 미들웨어 구현(GREEN). Task 14A(분산 락/Fencing Token)도 테스트 먼저.
 
 ### Task 13: 멱등성 없이 중복 발생 확인
 

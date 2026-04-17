@@ -34,8 +34,9 @@
 
 1. **Phase 순서대로 진행** — 각 Phase는 이전 Phase에 의존함
 2. **각 Phase의 "학습" 섹션 먼저 읽기** — 왜 이걸 하는지 이해한 후 구현
-3. **측정 → 개선 → 재측정** — 모든 개선은 Before/After 수치로 비교
-4. **Phase 1-9는 비용 $0** (전부 로컬), Phase 10-12에서 선택적으로 AWS 사용
+3. **TDD (Test-Driven Development)** — 테스트 먼저 작성(RED) → 최소 구현(GREEN) → 리팩토링(REFACTOR). 인프라/측정 Task는 예외
+4. **측정 → 개선 → 재측정** — 모든 개선은 Before/After 수치로 비교
+5. **Phase 1-9는 비용 $0** (전부 로컬), Phase 10-12에서 선택적으로 AWS 사용
 
 ## 파일 구조
 

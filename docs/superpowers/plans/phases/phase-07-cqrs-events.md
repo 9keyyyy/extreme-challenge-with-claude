@@ -222,7 +222,11 @@ async def get_post(post_id):
 
 ---
 
-## 구현
+## 구현 (TDD)
+
+개발 방식: **테스트 먼저 작성 (RED)** → **최소 구현 (GREEN)** → **리팩토링 (REFACTOR)**
+
+> 이벤트 발행 테스트 먼저 → event_service 구현 → consumer 구현. Task 15A/15B/15C는 모두 테스트 먼저 작성.
 
 ### Task 15: Redis Streams 이벤트 발행/소비
 

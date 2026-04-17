@@ -137,6 +137,8 @@ Circuit Breaker가 있으면: 5번 실패 후 바로 DB 폴백. Redis 대기 없
 
 ## 구현
 
+> **TDD 참고:** Task 19(장애 스크립트)는 인프라. Task 19A(Outbox Pattern)는 TDD 적용 — outbox 저장 테스트 먼저 작성 후 모델/relay 구현. Task 19B/19C는 장애 시뮬레이션 테스트 자체가 검증.
+
 ### Task 19: 장애 시뮬레이션 스크립트
 
 **Files:**

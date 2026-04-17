@@ -133,6 +133,8 @@ M1/M2 16GB 맥에서 core + replica까지는 여유 있음. monitoring까지 올
 
 ## 구현
 
+> **TDD 참고:** 이 Phase는 Docker Compose 인프라 구성이라 TDD 대상 아님. Health check + 연결 확인으로 검증.
+
 ### Task 10A: 멀티 인스턴스 Docker Compose 구성
 
 **Files:**

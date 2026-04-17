@@ -177,7 +177,11 @@ GETSET post:1:views 0
 
 ---
 
-## 구현
+## 구현 (TDD)
+
+개발 방식: **테스트 먼저 작성 (RED)** → **최소 구현 (GREEN)** → **리팩토링 (REFACTOR)**
+
+> Task 11(Before 벤치마크)은 측정이라 TDD 대상 아님. Task 12(Redis 카운터 전환)부터 TDD 적용 — 카운터 정확도 테스트 먼저 작성 후 counter_service/counter_sync 구현. Task 12A(분산 검증)도 테스트 먼저.
 
 ### Task 11: DB 카운터 부하 테스트 (Before)
 
