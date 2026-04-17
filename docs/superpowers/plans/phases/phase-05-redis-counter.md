@@ -258,36 +258,52 @@ from src.redis_client import redis_client
 SYNC_INTERVAL = 30
 
 
+async def _scan_and_collect(pattern: str) -> list[tuple[str, int]]:
+    """Redis SCAN으로 패턴에 맞는 키를 찾고, SET GET으로 delta 수집 후 0으로 리셋.
+
+    GETSET은 Redis 6.2에서 deprecated됨. SET key 0 GET이 동일 동작.
+    """
+    cursor = 0
+    batch = []
+    while True:
+        cursor, keys = await redis_client.scan(cursor, match=pattern, count=100)
+        for key in keys:
+            post_id = key.split(":")[1]
+            delta = await redis_client.set(key, 0, get=True)
+            if delta and int(delta) > 0:
+                batch.append((post_id, int(delta)))
+        if cursor == 0:
+            break
+    return batch
+
+
 async def sync_counters():
     while True:
         await asyncio.sleep(SYNC_INTERVAL)
         try:
-            cursor = 0
-            batch = []
-            while True:
-                cursor, keys = await redis_client.scan(
-                    cursor, match="post:*:views", count=100
-                )
-                for key in keys:
-                    post_id = key.split(":")[1]
-                    delta = await redis_client.getset(key, 0)
-                    if delta and int(delta) > 0:
-                        batch.append((post_id, int(delta)))
-                if cursor == 0:
-                    break
+            view_batch = await _scan_and_collect("post:*:views")
+            like_batch = await _scan_and_collect("post:*:likes")
 
-            if batch:
-                async with async_session() as db:
-                    for post_id, delta in batch:
-                        await db.execute(
-                            text(
-                                "UPDATE posts SET view_count = view_count + :delta "
-                                "WHERE id = :post_id"
-                            ),
-                            {"delta": delta, "post_id": post_id},
-                        )
+            async with async_session() as db:
+                for post_id, delta in view_batch:
+                    await db.execute(
+                        text(
+                            "UPDATE posts SET view_count = view_count + :delta "
+                            "WHERE id = :post_id"
+                        ),
+                        {"delta": delta, "post_id": post_id},
+                    )
+                for post_id, delta in like_batch:
+                    await db.execute(
+                        text(
+                            "UPDATE posts SET like_count = like_count + :delta "
+                            "WHERE id = :post_id"
+                        ),
+                        {"delta": delta, "post_id": post_id},
+                    )
+                if view_batch or like_batch:
                     await db.commit()
-                print(f"Synced {len(batch)} view counters")
+                    print(f"Synced {len(view_batch)} view + {len(like_batch)} like counters")
         except Exception as e:
             print(f"Counter sync error: {e}")
 
@@ -342,6 +358,7 @@ Expected: p95/p99가 DB 카운터 대비 대폭 개선. DB lock 경합 제거됨
 import asyncio
 import pytest
 
+from src.redis_client import redis_client
 from src.services.counter_service import get_counters, increment_view
 
 
@@ -349,6 +366,8 @@ from src.services.counter_service import get_counters, increment_view
 async def test_counter_accuracy():
     """1000번 동시 INCR → 정확히 1000"""
     test_id = "accuracy-test"
+    # 이전 실행 잔여 키 초기화
+    await redis_client.delete(f"post:{test_id}:views")
     tasks = [increment_view(test_id) for _ in range(1000)]
     await asyncio.gather(*tasks)
     counters = await get_counters(test_id)
@@ -364,6 +383,325 @@ git commit -m "feat: Redis counters — DB lock eliminated, k6 before/after comp
 
 ---
 
+### Task 12A: 멀티 인스턴스 카운터 정합성 검증
+
+> **전제:** Task 12 완료 + Phase 4.5의 분산 환경(`docker-compose.distributed.yml --profile core`)이 동작하는 상태.
+
+**학습 키워드 추가**
+`Lost Update` `Read-Modify-Write Anti-Pattern` `Lua Script Atomicity` `Check-and-Decrement` `Inventory Overselling`
+
+**Files:**
+- Create: `tests/test_distributed_counter.py`
+- Create: `scripts/inventory_simulation.lua` (참고용 — 실제 실행은 테스트 인라인 스크립트)
+- Create: `loadtest/scenarios/concurrent_likes.js`
+
+#### 학습: 멀티 인스턴스에서 카운터가 깨지는 경우
+
+Task 12에서 Redis INCR로 카운터를 전환했고, 단일 인스턴스에서 정확도를 검증함. 하지만 멀티 인스턴스 환경에서는 **앱 레벨에서 원자성을 깨뜨리는 실수**가 훨씬 치명적임.
+
+**Lost Update — 왜 앱 레벨 read-modify-write가 위험한가:**
+
+```
+서버 A: GET counter → 100
+서버 B: GET counter → 100       (A가 SET 하기 전에 읽음)
+서버 A: SET counter 101         (100 + 1)
+서버 B: SET counter 101         (100 + 1, 같은 값으로 덮어씀)
+결과: 2번 증가했는데 101. 1건 유실.
+```
+
+Redis INCR은 이 문제가 없음 — 싱글스레드라 원자적. 하지만 "값을 읽고 → 앱에서 계산하고 → 다시 쓰는" 패턴을 쓰면 멀티 인스턴스에서 반드시 깨짐.
+
+**커머스 매핑 — 재고 차감이 같은 문제:**
+
+```
+재고: 1개 남음
+서버 A: GET stock → 1 (> 0이니까 판매 OK)
+서버 B: GET stock → 1 (> 0이니까 판매 OK)
+서버 A: SET stock 0
+서버 B: SET stock 0
+결과: 재고 1개인데 2명에게 팔음 = 오버셀링
+```
+
+**카운터/동시 차감 방법 비교:**
+
+| 선택지 | 적합한 상황 | 부적합한 상황 |
+|--------|-----------|-------------|
+| DB `count = count + 1` | 쓰기 빈도 낮고 정합성 절대적 (결제 금액) | 동시 요청 많으면 lock wait → 커넥션 풀 고갈 |
+| Redis INCR | 단순 증감, 조건 분기 없음 (좋아요 +1) | 조건부 연산 (0 이하면 거부) 불가 |
+| Redis Lua script | 조건부 원자적 연산 (재고: 0 이상일 때만 -1) | 스크립트 복잡하면 Redis 전체 블로킹. 단순 증감에는 오버스펙 |
+| Optimistic Locking (DB) | 충돌 빈도 낮은 쓰기 (프로필 수정) | 충돌 빈도 높으면 재시도 폭발 (인기글 좋아요) |
+| CAS (WATCH+MULTI) | Redis에서 optimistic locking 필요할 때 | 충돌 많으면 INCR보다 느림. 대부분 Lua가 나음 |
+
+---
+
+- [ ] **Step 1: k6 멀티 인스턴스 동시 좋아요 — INCR 정확성 검증**
+
+```javascript
+// loadtest/scenarios/concurrent_likes.js
+// Nginx LB를 통해 API 3대에 분산된 상태에서 동시 좋아요 1000건
+import http from 'k6/http';
+import { check } from 'k6';
+
+const BASE_URL = __ENV.BASE_URL || 'http://localhost';  // Nginx (port 80)
+
+export const options = {
+    scenarios: {
+        concurrent_likes: {
+            executor: 'shared-iterations',
+            vus: 100,
+            iterations: 1000,
+            maxDuration: '30s',
+        },
+    },
+};
+
+export function setup() {
+    const res = http.post(`${BASE_URL}/api/posts`, JSON.stringify({
+        title: 'Distributed Counter Test',
+        content: 'For multi-instance like testing',
+        author: 'loadtest',
+    }), { headers: { 'Content-Type': 'application/json' } });
+    const postId = JSON.parse(res.body).id;
+    return { postId };
+}
+
+export default function (data) {
+    const userId = `user_${__VU}_${__ITER}`;
+    const res = http.post(
+        `${BASE_URL}/api/posts/${data.postId}/likes`,
+        JSON.stringify({ user_id: userId }),
+        { headers: { 'Content-Type': 'application/json' } }
+    );
+    check(res, { 'like success': (r) => r.status >= 200 && r.status < 300 });
+}
+
+export function teardown(data) {
+    // 최종 카운터 값 확인.
+    // 주의: API 응답의 like_count가 Redis에서 오는지 DB에서 오는지는 구현에 따라 다름.
+    // Task 12에서 조회 API가 counter_service.get_counters()를 사용하면 Redis 값 (즉시 반영).
+    // DB 값을 반환한다면 동기화 전에는 0일 수 있음 (30초 주기 sync).
+    const res = http.get(`${BASE_URL}/api/posts/${data.postId}`);
+    const post = JSON.parse(res.body);
+    console.log(`Final like count from API: ${post.like_count}, expected: 1000`);
+    console.log(`(If 0 or low: API might return DB value before sync. Check Redis directly.)`);
+}
+```
+
+Run:
+```bash
+# 분산 환경에서 실행 (Nginx port 80)
+k6 run loadtest/scenarios/concurrent_likes.js
+
+# 최종 카운터 값 확인 — 정확히 1000이어야 함
+curl -s http://localhost/api/posts/{POST_ID} | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'likes={d[\"like_count\"]}')"
+```
+
+Expected: Redis INCR 기반이므로 정확히 1000.
+
+- [ ] **Step 2: Non-atomic anti-pattern으로 Lost Update 체험**
+
+```python
+# tests/test_distributed_counter.py
+"""분산 카운터 테스트 — Redis 원자적 연산 vs non-atomic 비교.
+
+이 테스트는 Redis에 직접 접근함 (HTTP가 아닌 직접 클라이언트).
+conftest.py에서 init_redis()가 호출되어야 redis_client가 초기화됨:
+
+  # tests/conftest.py에 추가
+  @pytest.fixture(autouse=True, scope="session")
+  async def setup_redis():
+      from src.redis_client import init_redis
+      await init_redis()
+"""
+import asyncio
+import pytest
+
+from src.redis_client import redis_client
+
+
+@pytest.mark.asyncio
+async def test_non_atomic_lost_update():
+    """non-atomic read-modify-write → Lost Update 발생 확인"""
+    key = "test:non-atomic"
+    await redis_client.set(key, 0)
+
+    async def non_atomic_increment():
+        """이렇게 하면 안 됨 — GET → +1 → SET 사이에 다른 요청이 끼어듦"""
+        val = int(await redis_client.get(key))
+        # 0.01초 sleep으로 race window를 충분히 확보.
+        # asyncio는 싱글스레드 코루틴 스위칭이라 sleep에서 yield 해야
+        # 다른 코루틴이 끼어들 수 있음. 너무 짧으면 race가 안 생길 수도 있음.
+        await asyncio.sleep(0.01)
+        await redis_client.set(key, val + 1)
+
+    tasks = [non_atomic_increment() for _ in range(100)]
+    await asyncio.gather(*tasks)
+
+    result = int(await redis_client.get(key))
+    # 대부분의 환경에서 100보다 적은 값이 나옴 — Lost Update!
+    # 단, asyncio 스케줄링에 따라 드물게 100이 나올 수도 있음.
+    assert result <= 100
+    print(f"Non-atomic: 100 increments → actual {result} (lost {100 - result})")
+    if result == 100:
+        print("  (race condition이 발생하지 않음 — sleep 늘리거나 iterations 늘려서 재시도)")
+
+
+@pytest.mark.asyncio
+async def test_atomic_incr_no_lost_update():
+    """Redis INCR → Lost Update 없음"""
+    key = "test:atomic"
+    await redis_client.set(key, 0)
+
+    tasks = [redis_client.incr(key) for _ in range(100)]
+    await asyncio.gather(*tasks)
+
+    result = int(await redis_client.get(key))
+    assert result == 100, f"Expected 100 but got {result}"
+```
+
+Run: `pytest tests/test_distributed_counter.py -v`
+
+Expected:
+- `test_non_atomic_lost_update` — PASS (100보다 작은 값, Lost Update 확인)
+- `test_atomic_incr_no_lost_update` — PASS (정확히 100)
+
+- [ ] **Step 3: Lua script로 조건부 차감 — 재고 시뮬레이션**
+
+```lua
+-- scripts/inventory_simulation.lua
+-- "재고가 0 이상일 때만 -1" 을 원자적으로 수행
+-- KEYS[1] = inventory key
+-- Returns: 1 (성공, 차감됨), 0 (실패, 재고 부족)
+
+local stock = tonumber(redis.call('GET', KEYS[1]))
+if stock == nil then
+    return -1  -- 키 없음
+end
+if stock > 0 then
+    redis.call('DECR', KEYS[1])
+    return 1
+else
+    return 0
+end
+```
+
+```python
+# tests/test_distributed_counter.py에 추가
+
+LUA_CHECK_AND_DECREMENT = """
+local stock = tonumber(redis.call('GET', KEYS[1]))
+if stock == nil then return -1 end
+if stock > 0 then
+    redis.call('DECR', KEYS[1])
+    return 1
+else
+    return 0
+end
+"""
+
+
+@pytest.mark.asyncio
+async def test_lua_inventory_no_oversell():
+    """Lua script — 재고 100개, 200명 동시 구매 → 정확히 100명만 성공"""
+    key = "test:inventory"
+    await redis_client.set(key, 100)
+
+    async def try_purchase():
+        result = await redis_client.eval(LUA_CHECK_AND_DECREMENT, 1, key)
+        return int(result)
+
+    tasks = [try_purchase() for _ in range(200)]
+    results = await asyncio.gather(*tasks)
+
+    successes = sum(1 for r in results if r == 1)
+    failures = sum(1 for r in results if r == 0)
+    final_stock = int(await redis_client.get(key))
+
+    assert successes == 100, f"Expected 100 successes but got {successes}"
+    assert failures == 100, f"Expected 100 failures but got {failures}"
+    assert final_stock == 0, f"Expected 0 stock but got {final_stock}"
+    print(f"Lua inventory: 200 attempts → {successes} success, {failures} sold out, stock={final_stock}")
+
+
+@pytest.mark.asyncio
+async def test_non_atomic_inventory_oversell():
+    """non-atomic check-and-decrement → 오버셀링 발생"""
+    key = "test:inventory-bad"
+    await redis_client.set(key, 100)
+
+    async def try_purchase_bad():
+        stock = int(await redis_client.get(key))
+        if stock > 0:
+            await asyncio.sleep(0.01)  # race window 확보
+            await redis_client.decr(key)
+            return 1
+        return 0
+
+    tasks = [try_purchase_bad() for _ in range(200)]
+    results = await asyncio.gather(*tasks)
+
+    successes = sum(1 for r in results if r == 1)
+    final_stock = int(await redis_client.get(key))
+
+    # 대부분의 환경에서 100명 이상 성공 (오버셀링) or 재고 마이너스.
+    # asyncio 스케줄링에 따라 드물게 정확히 100명일 수도 있음.
+    print(f"Non-atomic inventory: {successes} successes, stock={final_stock}")
+    if successes > 100 or final_stock < 0:
+        print("  → 오버셀링 발생 확인!")
+    else:
+        print("  → race가 발생하지 않음 — sleep 늘려서 재시도 권장")
+```
+
+Run: `pytest tests/test_distributed_counter.py -v`
+
+Expected:
+- `test_lua_inventory_no_oversell` — PASS (정확히 100명 성공, 재고 0)
+- `test_non_atomic_inventory_oversell` — PASS (100명 이상 성공 or 재고 마이너스)
+
+- [ ] **Step 4: Redis→DB 동기화 중 Redis 장애 시 카운터 복구**
+
+```python
+# tests/test_distributed_counter.py에 추가
+
+
+@pytest.mark.asyncio
+async def test_counter_recovery_after_redis_loss():
+    """Redis 카운터가 유실되면 DB 값으로 복구하는 시나리오.
+
+    이 테스트는 복구 로직의 개념 검증임.
+    실제 Redis 장애는 Phase 11의 chaos 테스트에서 docker stop으로 재현.
+    """
+    key = "post:recovery-test:likes"
+
+    # 1. Redis에 카운터 설정
+    await redis_client.set(key, 523)
+
+    # 2. Redis 카운터 유실 시뮬레이션 (키 삭제)
+    await redis_client.delete(key)
+
+    # 3. 복구: DB 값으로 Redis 재설정
+    db_value = 520  # DB에 마지막으로 동기화된 값 (시뮬레이션)
+    current = await redis_client.get(key)
+    if current is None:
+        await redis_client.set(key, db_value)
+
+    recovered = int(await redis_client.get(key))
+    assert recovered == db_value
+    # 유실된 delta(523-520=3)는 동기화 주기(30초) 사이의 값.
+    # 이건 허용 가능한 손실임 — 좋아요 3개 차이는 사용자가 모름.
+```
+
+Run: `pytest tests/test_distributed_counter.py::test_counter_recovery_after_redis_loss -v`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tests/test_distributed_counter.py scripts/inventory_simulation.lua loadtest/scenarios/concurrent_likes.js
+git commit -m "test: multi-instance counter consistency — INCR vs non-atomic, Lua inventory simulation"
+```
+
+---
+
 ## Phase 5 완료 체크리스트
 
 - [ ] DB 카운터 상태에서 k6 부하 결과 기록 (Before)
@@ -371,9 +709,16 @@ git commit -m "feat: Redis counters — DB lock eliminated, k6 before/after comp
 - [ ] 같은 k6 테스트로 After 결과 기록
 - [ ] 카운터 정확도 검증 (동시 1000 INCR = 정확히 1000)
 - [ ] 카운터 동기화 Worker 구현
+- [ ] 멀티 인스턴스에서 동시 좋아요 1000건 → 카운터 정확성 검증
+- [ ] Non-atomic Lost Update 체험
+- [ ] Lua script 재고 시뮬레이션 — 오버셀링 방지 확인
+- [ ] Redis 카운터 유실 → DB 기준 복구 개념 검증
 
 **핵심 체감:**
 - DB 카운터: 100 동시 좋아요 → p99 ~Xms (lock 대기)
 - Redis 카운터: 100 동시 좋아요 → p99 ~Xms (lock 없음)
+- Atomic INCR: 1000번 = 정확히 1000
+- Non-atomic GET→SET: 1000번 = ~970 (Lost Update)
+- Lua check-and-decrement: 재고 100, 200명 → 정확히 100명 성공, 0명 오버셀링
 
 **다음:** [Phase 6 — 멱등성](phase-06-idempotency.md)

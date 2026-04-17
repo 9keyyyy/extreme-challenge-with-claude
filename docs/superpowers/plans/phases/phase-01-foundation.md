@@ -3,7 +3,17 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans
 
 **학습 키워드**
-`ASGI vs WSGI` `async/await` `이벤트 루프` `Connection Pool` `ORM vs Raw SQL` `Pydantic Validation` `Optimistic Locking` `UNIQUE Constraint` `UUID vs Auto-increment` `Docker Compose` `Alembic Migration`
+`ASGI vs WSGI` `async/await` `이벤트 루프` `Connection Pool` `ORM vs Raw SQL` `Pydantic Validation` `Optimistic Locking` `UNIQUE Constraint` `UUID vs Auto-increment` `Docker Compose` `Alembic Migration` `Clean Architecture` `Repository Pattern` `Dependency Injection` `TDD`
+
+**아키텍처:** Router → Service → Repository (클린 아키텍처, DI 기반)
+**개발 방식:** TDD (테스트 먼저 → 구현 → 리팩토링)
+**docker-compose:** PostgreSQL만 (Redis는 Phase 4, MinIO는 Phase 8에서 추가)
+
+**의도적으로 느린 패턴** (후속 Phase에서 개선하며 차이 체감):
+- OFFSET 페이지네이션 → Phase 3에서 커서로 교체
+- 조회수 DB 직접 UPDATE → Phase 5에서 Redis INCR로 교체
+- 좋아요 DB 직접 UPDATE → Phase 5에서 Redis INCR로 교체
+- 캐시 없음 → Phase 4에서 Redis 캐시 추가
 
 ---
 

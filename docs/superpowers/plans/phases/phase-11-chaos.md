@@ -352,17 +352,588 @@ git commit -m "feat: chaos engineering scripts — Redis/DB/network failure simu
 
 ---
 
+### Task 19A: Outbox Pattern — DB + 이벤트 원자성 보장
+
+> **전제:** Task 19 완료.
+
+**학습 키워드 추가**
+`Outbox Pattern` `Transactional Outbox` `Relay Worker` `At-Least-Once Publishing` `CDC (Debezium)`
+
+**Files:**
+- Create: `src/models/outbox.py`
+- Create: `src/workers/outbox_relay.py`
+- Modify: `src/api/command/posts.py`
+- Create: `tests/test_outbox.py`
+
+#### 학습: DB + 이벤트 발행의 원자성 문제
+
+**현재 코드의 문제:**
+
+```python
+async def create_post(data):
+    post = await db.insert(data)      # 1. DB 커밋 성공
+    await redis.xadd("events", ...)   # 2. 이벤트 발행
+    return post
+```
+
+1번은 성공했는데 2번 전에 프로세스가 죽으면? → DB에는 게시글이 있는데 이벤트는 발행 안 됨 → Consumer가 캐시 무효화 안 함 → 캐시에 구버전 영구 잔류.
+
+**역순도 문제:**
+
+```python
+await redis.xadd("events", ...)   # 1. 이벤트 발행 성공
+await db.insert(data)              # 2. DB 커밋 — 실패하면?
+```
+
+이벤트는 발행됐는데 DB에 데이터가 없음 → Consumer가 "게시글 생성됨" 이벤트를 받고 캐시를 갱신하려는데 게시글이 없음.
+
+**Outbox Pattern으로 해결:**
+
+```python
+async with db.begin():
+    post = await db.insert(data)
+    await db.insert(outbox_events, {type: "post.created", payload: {...}})
+    # 같은 DB 트랜잭션 → 둘 다 성공하거나 둘 다 실패
+
+# 별도 Relay Worker가 outbox_events를 polling → Redis Streams에 발행 → 발행 완료 row 업데이트
+```
+
+**이벤트 발행 실패 보호 전략 비교:**
+
+| 선택지 | 적합한 상황 | 부적합한 상황 |
+|--------|-----------|-------------|
+| Outbox Pattern | DB + 이벤트 원자성 필요, 추가 인프라 최소 | 발행 지연(polling 간격) 허용 안 되는 실시간 시스템 |
+| CDC (Debezium) | 앱 코드 변경 없이 DB WAL에서 이벤트 추출 | Kafka Connect + Debezium 인프라 필요, 로컬에서 무거움 |
+| try/except + 로그 | 이벤트 유실이 비즈니스에 치명적이지 않은 경우 | 결제/주문처럼 유실 시 돈이 꼬이는 경우 |
+
+커머스 매핑: 주문 생성(DB) + 재고 차감 이벤트가 원자적이지 않으면 재고 불일치. Outbox가 업계 표준.
+
+---
+
+- [ ] **Step 1: 문제 재현 — DB 커밋 성공 + 이벤트 유실**
+
+```python
+# tests/test_outbox.py
+"""Outbox Pattern 테스트 — DB+이벤트 원자성."""
+import asyncio
+import pytest
+import httpx
+
+NGINX_URL = "http://localhost"
+
+
+@pytest.mark.asyncio
+async def test_event_lost_without_outbox():
+    """현재 구조에서 이벤트 유실 가능성 확인.
+
+    이 테스트는 실제 크래시를 시뮬레이션하기 어려우므로,
+    Redis Streams에 이벤트가 있는지 DB에 게시글이 있는지 비교하는 개념 검증.
+    """
+    from src.redis_client import redis_client
+
+    # 현재 이벤트 수 기록
+    stream_info = await redis_client.xlen("events")
+    print(f"Before: {stream_info} events in stream")
+
+    # 게시글 생성 (정상)
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{NGINX_URL}/api/posts",
+            json={"title": "Outbox Test", "content": "test", "author": "tester"},
+            headers={"Idempotency-Key": f"outbox-test-{asyncio.get_event_loop().time()}"},
+        )
+        assert r.status_code == 201
+
+    after_count = await redis_client.xlen("events")
+    print(f"After: {after_count} events in stream")
+    print("현재 구조: DB INSERT + XADD가 별도 → 중간에 crash 시 이벤트 유실 가능")
+```
+
+- [ ] **Step 2: Outbox 테이블 + 트랜잭션 내 이벤트 기록**
+
+```python
+# src/models/outbox.py
+import uuid
+from datetime import datetime
+
+from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from src.models.post import Base
+
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    event_type: Mapped[str] = mapped_column(String(100))
+    payload: Mapped[str] = mapped_column(Text)
+    published: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+```
+
+```python
+# src/api/command/posts.py — create_post를 Outbox 패턴으로 수정
+import json
+from src.models.outbox import OutboxEvent
+
+@router.post("", response_model=PostResponse, status_code=201)
+async def create_post(data: PostCreate, db: AsyncSession = Depends(get_write_db)):
+    post = Post(**data.model_dump())
+    db.add(post)
+
+    # 같은 트랜잭션에서 outbox에 이벤트 기록
+    outbox = OutboxEvent(
+        event_type="post.created",
+        payload=json.dumps({"id": str(post.id), "title": post.title}, default=str),
+    )
+    db.add(outbox)
+
+    await db.commit()
+    # 이 시점에서 DB에 게시글 + outbox 이벤트가 원자적으로 존재
+    # Redis XADD는 여기서 안 함 — Relay Worker가 처리
+    #
+    # 중요: Task 15 Step 3에서 추가한 event_service.publish() 호출을 제거할 것.
+    # Outbox 패턴으로 전환하면 직접 XADD하면 안 됨 — Relay Worker가 유일한 발행 경로.
+    # 직접 XADD + Outbox Relay가 동시에 돌면 이벤트가 이중 발행됨.
+    return post
+```
+
+- [ ] **Step 3: Outbox Relay Worker**
+
+```python
+# src/workers/outbox_relay.py
+"""Outbox 이벤트를 Redis Streams로 발행하는 Relay Worker.
+
+polling 방식 — 5초마다 미발행 이벤트를 조회해서 Redis에 발행.
+"""
+import asyncio
+import json
+
+from sqlalchemy import select, update
+
+from src.database import async_session
+from src.models.outbox import OutboxEvent
+from src.redis_client import init_redis, redis_client
+
+POLL_INTERVAL = 5  # 초
+STREAM_KEY = "events"
+
+
+async def relay():
+    await init_redis()
+    print("Outbox relay worker started.")
+
+    while True:
+        try:
+            async with async_session() as db:
+                # 미발행 이벤트 조회 (오래된 것부터)
+                result = await db.execute(
+                    select(OutboxEvent)
+                    .where(OutboxEvent.published == False)
+                    .order_by(OutboxEvent.created_at)
+                    .limit(100)
+                )
+                events = result.scalars().all()
+
+                for event in events:
+                    # Redis Streams에 발행
+                    await redis_client.xadd(
+                        STREAM_KEY,
+                        {"type": event.event_type, "data": event.payload},
+                    )
+                    # 발행 완료 표시
+                    await db.execute(
+                        update(OutboxEvent)
+                        .where(OutboxEvent.id == event.id)
+                        .values(published=True)
+                    )
+
+                if events:
+                    await db.commit()
+                    print(f"Relayed {len(events)} outbox events")
+
+        except Exception as e:
+            print(f"Outbox relay error: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    asyncio.run(relay())
+```
+
+- [ ] **Step 4: Outbox 검증 — 프로세스 크래시 시뮬레이션**
+
+```python
+# tests/test_outbox.py에 추가
+
+
+@pytest.mark.asyncio
+async def test_outbox_survives_crash():
+    """DB 트랜잭션 내 outbox 기록 → 프로세스 죽어도 이벤트 남아있음.
+
+    실제 프로세스 crash는 시뮬레이션 어려우므로,
+    outbox에 미발행 이벤트가 있는지 확인하는 방식으로 검증.
+    """
+    import asyncpg
+
+    db = await asyncpg.connect(
+        "postgresql://postgres:postgres@localhost:5432/extreme_board"
+    )
+
+    # outbox에 미발행 이벤트가 있는지 확인
+    unpublished = await db.fetchval(
+        "SELECT COUNT(*) FROM outbox_events WHERE published = false"
+    )
+    total = await db.fetchval("SELECT COUNT(*) FROM outbox_events")
+    print(f"Outbox: total={total}, unpublished={unpublished}")
+    print("unpublished > 0이면 Relay Worker가 아직 처리 안 한 것 (정상)")
+    print("핵심: DB에 이벤트가 있으므로 프로세스가 죽어도 유실 없음")
+    await db.close()
+```
+
+- [ ] **Step 5: Alembic 마이그레이션 + Compose에 Relay Worker 추가 + Commit**
+
+```yaml
+# docker-compose.distributed.yml에 추가
+  outbox-relay:
+    build: .
+    command: python -m src.workers.outbox_relay
+    environment: *app-env
+    depends_on: [db, redis-primary]
+    profiles: ["core"]
+```
+
+```bash
+alembic revision --autogenerate -m "add outbox_events table"
+alembic upgrade head
+git add -A
+git commit -m "feat: outbox pattern — DB+event atomicity with relay worker"
+```
+
+---
+
+### Task 19B: Redis Failover Write 유실 확인
+
+> **전제:** Task 19A 완료. Redis Sentinel 환경.
+
+**학습 키워드 추가**
+`Failover Write Loss` `WAIT command` `Asynchronous Replication` `Split Brain`
+
+**Files:**
+- Create: `tests/test_redis_failover.py`
+
+#### 학습: Redis Failover 중 Write 유실 메커니즘
+
+Redis Sentinel은 자동 failover를 제공하지만, **비동기 복제** 특성상 write 유실이 발생할 수 있음:
+
+```
+1. Client → Primary에 SET key value → "OK" 응답
+2. Primary → Replica로 복제 시작 (비동기)
+3. Primary 죽음 ☠️ (복제 완료 전)
+4. Sentinel이 Replica를 새 Primary로 승격
+5. 새 Primary에는 2번의 SET이 없음 → write 유실
+```
+
+Client는 "OK"를 받았으니 성공이라 생각하지만, 실제로는 유실됨.
+
+**Redis failover 유실 대응 비교:**
+
+| 선택지 | 적합한 상황 | 부적합한 상황 |
+|--------|-----------|-------------|
+| 유실 허용 + DB 기준 복구 배치 | 캐시/카운터처럼 DB에서 재구축 가능한 데이터 | DB에 원본 없는 데이터 (세션) |
+| WAIT 명령 | 핵심 데이터 write에 선택적 적용 | 모든 write에 적용하면 지연 과다 |
+| AOF everysec | 최대 1초분 유실로 제한 | 완전 방지는 아님 |
+
+---
+
+- [ ] **Step 1: k6 지속 write + Redis primary docker stop**
+
+```python
+# tests/test_redis_failover.py
+"""Redis Failover Write 유실 측정.
+
+Sentinel 환경에서 primary를 죽이고 유실 규모를 측정.
+"""
+import asyncio
+import pytest
+
+from redis.asyncio.sentinel import Sentinel
+
+
+@pytest.mark.asyncio
+async def test_redis_failover_write_loss():
+    """write 지속 → primary stop → 유실 확인.
+
+    주의: 이 테스트는 docker stop을 직접 실행하므로
+    분산 환경이 완전히 떠 있는 상태에서 수동 실행 권장.
+    """
+    sentinel = Sentinel([("localhost", 26379)], socket_timeout=3)
+    r = sentinel.master_for("mymaster", decode_responses=True)
+
+    # 1. 연속 write — 각 write의 성공/실패 기록
+    success_keys = []
+    fail_count = 0
+    test_prefix = "failover-test"
+
+    print("Phase 1: Writing 1000 keys...")
+    for i in range(1000):
+        try:
+            key = f"{test_prefix}:{i}"
+            await r.set(key, f"value-{i}")
+            success_keys.append(key)
+        except Exception as e:
+            fail_count += 1
+            if fail_count == 1:
+                print(f"  First failure at key {i}: {e}")
+        await asyncio.sleep(0.001)  # 1ms 간격
+
+    print(f"  Written: {len(success_keys)}, Failed: {fail_count}")
+
+    # 2. 이 시점에서 수동으로 primary를 죽임:
+    #    docker compose -f docker-compose.distributed.yml stop redis-primary
+    #    → Sentinel이 redis-replica를 승격
+    #    → 수초 후 새 master에 연결
+    print("\n>>> 지금 다른 터미널에서 실행:")
+    print(">>> docker compose -f docker-compose.distributed.yml stop redis-primary")
+    print(">>> 10초 기다린 후 Enter...")
+    # 실제 테스트에서는 subprocess로 docker stop 실행하거나, 수동 실행
+
+    # 3. 새 master에서 실제로 남아있는 key 확인
+    await asyncio.sleep(15)  # failover 대기
+    r_new = sentinel.master_for("mymaster", decode_responses=True)
+    survived = 0
+    lost = 0
+    for key in success_keys:
+        val = await r_new.get(key)
+        if val:
+            survived += 1
+        else:
+            lost += 1
+
+    print(f"\nPhase 2: After failover")
+    print(f"  Survived: {survived}/{len(success_keys)}")
+    print(f"  Lost: {lost}/{len(success_keys)}")
+    print(f"  Loss rate: {lost/len(success_keys)*100:.2f}%")
+
+    # cleanup
+    for key in success_keys:
+        await r_new.delete(key)
+```
+
+Run: `pytest tests/test_redis_failover.py -v -s` (수동 docker stop 필요)
+
+- [ ] **Step 2: WAIT 명령으로 유실 감소 확인**
+
+```python
+# tests/test_redis_failover.py에 추가
+
+
+@pytest.mark.asyncio
+async def test_redis_wait_reduces_loss():
+    """WAIT 명령 — write가 replica에 복제될 때까지 대기.
+
+    WAIT numreplicas timeout:
+    - numreplicas: 최소 N대의 replica에 복제 확인
+    - timeout: 최대 대기 시간 (ms). 0이면 무한 대기
+    - 반환값: 실제로 복제 확인된 replica 수
+
+    WAIT은 모든 write에 쓰면 지연이 과다 → 핵심 데이터에만 선택적 적용.
+    """
+    sentinel = Sentinel([("localhost", 26379)], socket_timeout=3)
+    r = sentinel.master_for("mymaster", decode_responses=True)
+
+    # WAIT 적용한 write
+    key = "wait-test:critical"
+    await r.set(key, "important-value")
+    replicas_acked = await r.execute_command("WAIT", 1, 5000)
+    # replicas_acked >= 1 이면 최소 1대의 replica에 복제 완료
+    print(f"WAIT result: {replicas_acked} replica(s) acknowledged")
+
+    if replicas_acked >= 1:
+        print("✓ Replica에 복제 확인 → primary 죽어도 이 write는 안전")
+    else:
+        print("⚠ Replica 복제 타임아웃 → 유실 가능성 있음")
+
+    await r.delete(key)
+```
+
+Run: `pytest tests/test_redis_failover.py::test_redis_wait_reduces_loss -v -s`
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/test_redis_failover.py
+git commit -m "test: Redis failover write loss measurement + WAIT command"
+```
+
+---
+
+### Task 19C: 장애 복구 후 정합성 감사/복구
+
+> **전제:** Task 19B 완료.
+
+**Files:**
+- Create: `scripts/consistency_recovery.py`
+- Create: `tests/test_disaster_recovery.py`
+
+#### 학습: 장애 후 대사(Reconciliation)
+
+장애가 발생하면 데이터 불일치가 생김. 복구 후에는 **어디가 어긋났는지 파악(감사)** → **DB를 기준으로 Redis를 재동기화(복구)** 가 필요함.
+
+커머스 매핑: 장애 후 재고 대사 — 실제 재고 DB와 캐시/이벤트 기반 재고를 비교해서 맞추는 작업.
+
+---
+
+- [ ] **Step 1: 자동 복구 스크립트 — DB 기준 Redis 재동기화**
+
+```python
+# scripts/consistency_recovery.py
+"""장애 후 DB 기준으로 Redis 카운터 재동기화.
+
+감사 → 불일치 발견 → DB를 source of truth로 Redis 덮어씀.
+"""
+import asyncio
+
+import asyncpg
+from redis.asyncio.sentinel import Sentinel
+
+
+async def recover():
+    sentinel = Sentinel([("localhost", 26379)], socket_timeout=3)
+    redis = sentinel.master_for("mymaster", decode_responses=True)
+    db = await asyncpg.connect(
+        "postgresql://postgres:postgres@localhost:5432/extreme_board"
+    )
+
+    print("=== Consistency Recovery ===\n")
+
+    # 1. DB의 모든 카운터를 Redis에 동기화
+    posts = await db.fetch("SELECT id, like_count, view_count FROM posts")
+    synced = 0
+
+    for post in posts:
+        pid = str(post["id"])
+        redis_likes = int(await redis.get(f"post:{pid}:likes") or 0)
+        redis_views = int(await redis.get(f"post:{pid}:views") or 0)
+        db_likes = post["like_count"]
+        db_views = post["view_count"]
+
+        # Redis 값이 DB보다 작으면 (유실된 경우) DB 값으로 복구
+        # Redis 값이 DB보다 크면 (동기화 전 delta) 그대로 둠 — 다음 sync에서 반영
+        if redis_likes < db_likes:
+            await redis.set(f"post:{pid}:likes", db_likes)
+            print(f"  Recovered post {pid}: likes {redis_likes} → {db_likes}")
+            synced += 1
+        if redis_views < db_views:
+            await redis.set(f"post:{pid}:views", db_views)
+            print(f"  Recovered post {pid}: views {redis_views} → {db_views}")
+            synced += 1
+
+    # 2. 미발행 Outbox 이벤트 재발행
+    unpublished = await db.fetchval(
+        "SELECT COUNT(*) FROM outbox_events WHERE published = false"
+    )
+    print(f"\n  Unpublished outbox events: {unpublished}")
+    print("  (Outbox Relay Worker가 재시작되면 자동 발행됨)")
+
+    print(f"\n  Total recoveries: {synced}")
+    print("\n=== Recovery Complete ===")
+
+    await db.close()
+    await redis.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(recover())
+```
+
+- [ ] **Step 2: 장애 → 복구 → 감사 → 복구 통합 테스트**
+
+```python
+# tests/test_disaster_recovery.py
+"""장애 후 감사 + 복구 통합 테스트.
+
+시나리오:
+1. Redis에 카운터 설정
+2. Redis 장애 시뮬레이션 (키 삭제)
+3. 감사 스크립트로 불일치 확인
+4. 복구 스크립트로 DB 기준 재동기화
+"""
+import asyncio
+import subprocess
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_audit_then_recover():
+    """감사 → 불일치 발견 → 복구 → 재감사 흐름."""
+    from redis.asyncio.sentinel import Sentinel
+
+    sentinel = Sentinel([("localhost", 26379)], socket_timeout=3)
+    redis = sentinel.master_for("mymaster", decode_responses=True)
+
+    # 1. 테스트용 카운터 설정 (DB 값과 불일치)
+    await redis.set("post:test-recovery:likes", 0)  # Redis: 0
+    # DB에는 like_count가 있다고 가정 (audit 스크립트가 비교)
+
+    # 2. 감사 실행
+    result = subprocess.run(
+        ["python", "scripts/consistency_audit.py"],
+        capture_output=True, text=True,
+    )
+    print("=== Audit Output ===")
+    print(result.stdout)
+
+    # 3. 복구 실행
+    result = subprocess.run(
+        ["python", "scripts/consistency_recovery.py"],
+        capture_output=True, text=True,
+    )
+    print("=== Recovery Output ===")
+    print(result.stdout)
+
+    # 4. cleanup
+    await redis.delete("post:test-recovery:likes")
+```
+
+Run: `pytest tests/test_disaster_recovery.py -v -s`
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add scripts/consistency_recovery.py tests/test_disaster_recovery.py
+git commit -m "feat: disaster recovery — DB-based Redis resync + audit/recovery pipeline"
+```
+
+---
+
 ## Phase 11 완료 체크리스트
 
 - [ ] Redis 장애 시 DB 폴백 동작 확인
 - [ ] DB 장애 시 캐시 읽기 동작 확인 + 쓰기 에러 확인
 - [ ] 네트워크 지연 시 캐시 효과 확인
 - [ ] 부하 + 장애 동시 시나리오 실행
-- [ ] 장애 복구 후 데이터 정합성 확인
+- [ ] Outbox Pattern — DB 트랜잭션 + outbox 같이 커밋
+- [ ] Outbox Relay Worker — polling → Redis Streams 발행
+- [ ] DB 커밋 후 프로세스 crash → outbox에 이벤트 남아있음 확인
+- [ ] Redis Failover — primary stop → write 유실 확인
+- [ ] WAIT 명령으로 유실 감소 확인
+- [ ] 장애 후 감사 스크립트 실행 — 불일치 목록 출력
+- [ ] DB 기준 Redis 재동기화 복구
 
 **핵심 체감:**
 - Redis 죽어도 서비스는 돌아감 (느리지만 동작) = 캐시는 보조 계층
 - DB 죽으면 쓰기 불가, 읽기는 캐시로 버팀 = DB는 핵심 계층
-- 장애 복구 후 자동 정상화 = 좋은 아키텍처의 징표
+- Outbox: DB에 커밋 + 이벤트가 같은 트랜잭션 → 프로세스 죽어도 이벤트 안 유실
+- Redis Failover: 비동기 복제 → "OK" 받은 write도 유실 가능 → WAIT으로 완화 가능
+- 장애 복구 후: DB를 source of truth로 Redis 재동기화 → 자동화 필수
+- **"장애가 일어나면 어떡하지?"가 아니라 "장애는 반드시 일어난다"를 전제로 설계**
 
 **다음:** [Phase 12 — 클라우드 배포](phase-12-cloud.md)

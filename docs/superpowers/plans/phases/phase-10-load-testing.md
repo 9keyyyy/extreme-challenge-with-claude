@@ -346,6 +346,257 @@ git commit -m "feat: k6 load test scenarios — mixed, spike, stress"
 
 ---
 
+### Task 18A: 부하 중 분산 정합성 검증
+
+> **전제:** Task 18 완료 + Phase 4.5 분산 환경 + Phase 7의 PG Replica + Read-Your-Write 동작 상태.
+
+**학습 키워드 추가**
+`Consistency Audit` `Data Reconciliation` `pg_wal_lsn_diff` `Redis-DB Drift`
+
+**Files:**
+- Create: `scripts/consistency_audit.py`
+- Create: `loadtest/scenarios/mixed_load_distributed.js`
+- Create: `tests/test_load_consistency.py`
+
+Phase 5~7에서 만든 기능들을 **부하 아래에서** 검증함. 정상 상태에서 동작하는 코드가 부하에서도 동작하는지가 핵심.
+
+#### 학습: 왜 부하 중 정합성 검증이 필요한가
+
+단일 테스트에서 정합성이 맞아도, 부하 중에는 깨질 수 있음:
+- Redis INCR은 원자적 → 하지만 Redis→DB 동기화 워커가 밀려서 DB 값이 실제보다 적을 수 있음
+- 멱등성 키 체크가 정상 → 하지만 Redis 응답이 느려지면 락 획득 전 타임아웃 → 같은 키로 두 건 생성
+- Read-Your-Write 라우팅이 정상 → 하지만 부하 중 primary DB가 느려지면 쿠키 TTL 내 응답 못 줌
+
+이런 건 부하 테스트 + 정합성 감사를 함께 돌려야만 발견됨.
+
+---
+
+- [ ] **Step 1: 분산 환경용 Mixed Load (Nginx 경유)**
+
+```javascript
+// loadtest/scenarios/mixed_load_distributed.js
+// Phase 10의 mixed_load.js와 동일하되, Nginx LB(port 80) 경유
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { randomIntBetween } from 'https://jslib.k6.io/k6-utils/1.2.0/index.js';
+
+const BASE_URL = __ENV.BASE_URL || 'http://localhost';  // Nginx
+
+export const options = {
+    stages: [
+        { duration: '1m', target: 50 },
+        { duration: '3m', target: 200 },
+        { duration: '2m', target: 500 },
+        { duration: '2m', target: 200 },
+        { duration: '1m', target: 0 },
+    ],
+    thresholds: {
+        http_req_duration: ['p(95)<500', 'p(99)<2000'],
+        http_req_failed: ['rate<0.05'],
+    },
+};
+
+export function setup() {
+    const posts = [];
+    for (let i = 0; i < 10; i++) {
+        const res = http.post(`${BASE_URL}/api/posts`, JSON.stringify({
+            title: `Distributed Load Test ${i}`,
+            content: `Content ${i}`,
+            author: `loadtest-${i}`,
+        }), {
+            headers: {
+                'Content-Type': 'application/json',
+                'Idempotency-Key': `setup-${i}-${Date.now()}`,
+            },
+        });
+        if (res.status === 201) posts.push(JSON.parse(res.body).id);
+    }
+    return { postIds: posts };
+}
+
+export default function (data) {
+    const rand = Math.random();
+    if (rand < 0.70) {
+        const res = http.get(`${BASE_URL}/api/posts?limit=20`);
+        check(res, { 'list 200': (r) => r.status === 200 });
+    } else if (rand < 0.95) {
+        const postId = data.postIds[randomIntBetween(0, data.postIds.length - 1)];
+        http.get(`${BASE_URL}/api/posts/${postId}`);
+    } else if (rand < 0.98) {
+        const postId = data.postIds[randomIntBetween(0, data.postIds.length - 1)];
+        http.post(`${BASE_URL}/api/posts/${postId}/likes`,
+            JSON.stringify({ user_id: `user_${__VU}_${__ITER}` }),
+            { headers: { 'Content-Type': 'application/json' } }
+        );
+    } else {
+        http.post(`${BASE_URL}/api/posts`, JSON.stringify({
+            title: `New ${__VU}-${__ITER}`,
+            content: 'Load content',
+            author: `user_${__VU}`,
+        }), {
+            headers: {
+                'Content-Type': 'application/json',
+                'Idempotency-Key': `load-${__VU}-${__ITER}-${Date.now()}`,
+            },
+        });
+    }
+    sleep(randomIntBetween(1, 3) / 10);
+}
+```
+
+Run:
+```bash
+docker compose -f docker-compose.distributed.yml --profile core --profile replica up -d
+k6 run loadtest/scenarios/mixed_load_distributed.js
+```
+
+- [ ] **Step 2: 정합성 감사 스크립트**
+
+```python
+# scripts/consistency_audit.py
+"""부하 테스트 후 데이터 정합성 감사.
+
+Redis 카운터 ↔ DB 카운터, 멱등성 키 중복, 이벤트 미처리 건 확인.
+"""
+import asyncio
+import json
+
+import asyncpg
+from redis.asyncio.sentinel import Sentinel
+
+
+async def audit():
+    # 연결
+    sentinel = Sentinel([("localhost", 26379)], socket_timeout=3)
+    redis = sentinel.master_for("mymaster", decode_responses=True)
+    db = await asyncpg.connect("postgresql://postgres:postgres@localhost:5432/extreme_board")
+
+    print("=== Consistency Audit ===\n")
+
+    # 1. Redis 카운터 vs DB 카운터
+    print("[1] Redis ↔ DB 카운터 비교")
+    posts = await db.fetch("SELECT id, like_count, view_count FROM posts LIMIT 50")
+    drift_count = 0
+    for post in posts:
+        pid = str(post["id"])
+        redis_likes = int(await redis.get(f"post:{pid}:likes") or 0)
+        redis_views = int(await redis.get(f"post:{pid}:views") or 0)
+        db_likes = post["like_count"]
+        db_views = post["view_count"]
+
+        # Redis 값은 동기화 전이라 DB보다 클 수 있음 (정상)
+        # DB 값이 Redis보다 크면 비정상 (동기화 중 유실)
+        if db_likes > redis_likes + 10 or db_views > redis_views + 10:
+            print(f"  ⚠ Post {pid}: DB likes={db_likes} > Redis={redis_likes}")
+            drift_count += 1
+
+    total = len(posts)
+    print(f"  검사: {total}건, 비정상 drift: {drift_count}건\n")
+
+    # 2. 멱등성 키 중복 확인
+    print("[2] 멱등성 키 중복 확인")
+    dup = await db.fetchval("""
+        SELECT COUNT(*) FROM (
+            SELECT key, COUNT(*) as cnt FROM idempotency_keys
+            GROUP BY key HAVING COUNT(*) > 1
+        ) dupes
+    """)
+    print(f"  중복 멱등성 키: {dup}건 (0이어야 정상)\n")
+
+    # 3. 이벤트 미처리 건 (Pending)
+    print("[3] Redis Streams 미처리 이벤트")
+    try:
+        pending = await redis.xpending("events", "board-consumers")
+        print(f"  Pending 메시지: {pending.get('pending', 0) if isinstance(pending, dict) else pending[0]}건")
+    except Exception as e:
+        print(f"  (Consumer Group 없음 or 에러: {e})")
+
+    # 4. Replication Lag
+    print("\n[4] PG Replication Lag")
+    try:
+        replica = await asyncpg.connect(
+            "postgresql://postgres:postgres@localhost:5433/extreme_board"
+        )
+        primary_lsn = await db.fetchval("SELECT pg_current_wal_lsn()")
+        replica_lsn = await replica.fetchval("SELECT pg_last_wal_receive_lsn()")
+        if primary_lsn and replica_lsn:
+            lag = await db.fetchval(
+                "SELECT pg_wal_lsn_diff($1, $2)", primary_lsn, replica_lsn
+            )
+            print(f"  Primary LSN: {primary_lsn}")
+            print(f"  Replica LSN: {replica_lsn}")
+            print(f"  Lag: {lag} bytes")
+        await replica.close()
+    except Exception as e:
+        print(f"  (Replica 미실행 or 에러: {e})")
+
+    print("\n=== Audit Complete ===")
+    await db.close()
+    await redis.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(audit())
+```
+
+Run: `python scripts/consistency_audit.py`
+
+- [ ] **Step 3: 부하 중 Replication Lag 추이 측정**
+
+```python
+# tests/test_load_consistency.py
+"""부하 중 Replication Lag + Read-Your-Write 검증.
+
+k6를 백그라운드로 실행하면서 이 테스트를 돌리면 부하 중 동작 확인.
+"""
+import asyncio
+import time
+import httpx
+import pytest
+
+NGINX_URL = "http://localhost"
+
+
+@pytest.mark.asyncio
+async def test_read_your_write_under_load():
+    """부하 중 Read-Your-Write가 동작하는지 — 100회 반복."""
+    failures = 0
+    total = 100
+
+    async with httpx.AsyncClient(base_url=NGINX_URL) as client:
+        for i in range(total):
+            # write
+            r = await client.post(
+                "/api/posts",
+                json={"title": f"RYW Load {i}", "content": "test", "author": "ryw"},
+                headers={"Idempotency-Key": f"ryw-load-{i}-{time.time()}"},
+            )
+            if r.status_code != 201:
+                continue
+            post_id = r.json()["id"]
+
+            # 즉시 read (같은 클라이언트 → 쿠키 포함 → primary 라우팅)
+            r_read = await client.get(f"/api/posts/{post_id}")
+            if r_read.status_code != 200 or r_read.json()["title"] != f"RYW Load {i}":
+                failures += 1
+
+    failure_rate = failures / total * 100
+    print(f"Read-Your-Write under load: {failures}/{total} failures ({failure_rate:.1f}%)")
+    assert failure_rate < 5, f"Read-Your-Write failure rate too high: {failure_rate}%"
+```
+
+Run: `pytest tests/test_load_consistency.py -v -s`
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add scripts/consistency_audit.py loadtest/scenarios/mixed_load_distributed.js \
+  tests/test_load_consistency.py
+git commit -m "test: distributed consistency audit — Redis/DB drift, replication lag, RYW under load"
+```
+
+---
+
 ## Phase 10 완료 체크리스트
 
 - [ ] Mixed Load 테스트 실행 + 결과 기록
@@ -353,10 +604,16 @@ git commit -m "feat: k6 load test scenarios — mixed, spike, stress"
 - [ ] Stress 테스트 실행 + 한계점(breakpoint) 확인
 - [ ] Grafana에서 부하 중 메트릭 관찰
 - [ ] 병목 지점 식별 (DB? Redis? App? Network?)
+- [ ] 분산 환경(Nginx LB)에서 Mixed Load 실행
+- [ ] 정합성 감사 스크립트 실행 — Redis↔DB drift, 멱등성 중복, Pending 이벤트
+- [ ] 부하 중 Read-Your-Write 동작 검증 (100회 반복)
+- [ ] Replication Lag 부하 중 추이 관찰
 
 **핵심 체감:**
 - Mixed Load에서 p99가 급격히 올라가는 VU 수 = 현재 아키텍처의 실질적 한계
 - Spike 후 복구 시간 = 시스템 회복력 (resilience)
 - Stress에서 에러율 50% 넘는 지점 = 절대 한계
+- 부하 중 Redis↔DB drift = 동기화 워커의 한계 (30초 주기보다 빠르면 밀림)
+- 부하 중 Read-Your-Write 실패율 < 5% = 미들웨어가 부하에서도 동작함
 
 **다음:** [Phase 11 — 장애 시뮬레이션](phase-11-chaos.md)
