@@ -1,0 +1,11 @@
+[
+  "/api/v1/posts/[id]",
+  "/api/v1/posts/[id]/like",
+  "/posts/[id]",
+  "/posts/[id]/edit",
+  "/",
+  "/_not-found",
+  "/api/v1/posts",
+  "/favicon.ico",
+  "/posts/new"
+]
