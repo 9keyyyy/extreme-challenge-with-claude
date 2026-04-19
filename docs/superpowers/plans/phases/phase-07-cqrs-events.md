@@ -275,10 +275,13 @@ CONSUMER_NAME = os.getenv("CONSUMER_NAME", "consumer-1")
 async def consume():
     await init_redis()  # Sentinel 대응 — Phase 4.5에서 설정한 redis_client 사용
 
+    from redis.exceptions import ResponseError
+
     try:
         await redis_client.xgroup_create(STREAM_KEY, GROUP_NAME, id="0", mkstream=True)
-    except Exception:
-        pass  # 이미 존재
+    except ResponseError as e:
+        if "BUSYGROUP" not in str(e):
+            raise  # BUSYGROUP(이미 존재) 외의 에러는 전파
 
     print(f"Event consumer started: {CONSUMER_NAME}")
 

@@ -436,7 +436,7 @@ SENTINEL_MASTER = os.getenv("REDIS_SENTINEL_MASTER", "mymaster")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 
-async def get_redis_client():
+async def _create_client():
     """Sentinel 설정이 있으면 Sentinel 사용, 없으면 단일 Redis 사용.
 
     master_for()는 내부적으로 SentinelConnectionPool을 사용함.
@@ -455,13 +455,29 @@ async def get_redis_client():
     return redis.from_url(REDIS_URL, decode_responses=True)
 
 
-# 모듈 레벨 클라이언트는 앱 startup에서 초기화
-redis_client = None
+class _RedisProxy:
+    """Lazy-initialized Redis 프록시.
+
+    왜 프록시인가:
+    - Phase 4에서는 redis_client = redis.from_url(...)로 모듈 레벨 즉시 초기화
+    - Phase 4.5부터 Sentinel은 async 초기화 필요 (모듈 레벨에서 await 불가)
+    - global 변수 재바인딩(redis_client = new_client)은
+      기존 from src.redis_client import redis_client 참조를 끊음 (Python import 동작)
+    - 프록시 객체는 import된 참조를 유지하면서 내부 클라이언트만 교체
+    """
+    _client = None
+
+    def __getattr__(self, name):
+        if self._client is None:
+            raise RuntimeError("Redis not initialized. Call init_redis() first.")
+        return getattr(self._client, name)
+
+
+redis_client = _RedisProxy()
 
 
 async def init_redis():
-    global redis_client
-    redis_client = await get_redis_client()
+    redis_client._client = await _create_client()
 ```
 
 - [ ] **Step 6: main.py에 Redis 초기화 + /health에 인스턴스 식별 추가**
@@ -488,7 +504,7 @@ async def health():
     return {"status": "ok", "instance": INSTANCE_ID}
 ```
 
-기존 코드에서 `from src.redis_client import redis_client`로 직접 import하는 패턴은 그대로 동작함. `init_redis()`가 모듈 레벨 `redis_client` 변수를 설정하므로, startup 이후에는 기존 import가 정상적으로 초기화된 클라이언트를 참조함.
+`_RedisProxy` 덕분에 Phase 4에서 사용하던 `from src.redis_client import redis_client` import 패턴이 그대로 동작함. 프록시 객체의 참조는 유지되고, `init_redis()`가 내부 `_client`만 교체하기 때문. 만약 프록시 없이 `global redis_client` 재바인딩을 썼다면, 기존 import들이 `None`을 계속 참조하는 버그가 발생함 (Python `from ... import`는 import 시점의 값을 복사).
 
 - [ ] **Step 7: 분산 환경 동작 확인**
 

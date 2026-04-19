@@ -664,17 +664,28 @@ Client는 "OK"를 받았으니 성공이라 생각하지만, 실제로는 유실
 Sentinel 환경에서 primary를 죽이고 유실 규모를 측정.
 """
 import asyncio
-import pytest
+import subprocess
 
+import pytest
 from redis.asyncio.sentinel import Sentinel
+
+COMPOSE_FILE = "docker-compose.distributed.yml"
+
+
+def _docker_compose(*args):
+    """docker compose 명령 실행."""
+    subprocess.run(
+        ["docker", "compose", "-f", COMPOSE_FILE, *args],
+        check=True, capture_output=True,
+    )
 
 
 @pytest.mark.asyncio
 async def test_redis_failover_write_loss():
     """write 지속 → primary stop → 유실 확인.
 
-    주의: 이 테스트는 docker stop을 직접 실행하므로
-    분산 환경이 완전히 떠 있는 상태에서 수동 실행 권장.
+    주의: 분산 환경(--profile core)이 완전히 떠 있는 상태에서 실행.
+    subprocess로 docker stop/start를 자동 실행함.
     """
     sentinel = Sentinel([("localhost", 26379)], socket_timeout=3)
     r = sentinel.master_for("mymaster", decode_responses=True)
@@ -698,17 +709,12 @@ async def test_redis_failover_write_loss():
 
     print(f"  Written: {len(success_keys)}, Failed: {fail_count}")
 
-    # 2. 이 시점에서 수동으로 primary를 죽임:
-    #    docker compose -f docker-compose.distributed.yml stop redis-primary
-    #    → Sentinel이 redis-replica를 승격
-    #    → 수초 후 새 master에 연결
-    print("\n>>> 지금 다른 터미널에서 실행:")
-    print(">>> docker compose -f docker-compose.distributed.yml stop redis-primary")
-    print(">>> 10초 기다린 후 Enter...")
-    # 실제 테스트에서는 subprocess로 docker stop 실행하거나, 수동 실행
+    # 2. subprocess로 primary 중단 → Sentinel이 replica 승격
+    print("\nStopping redis-primary...")
+    _docker_compose("stop", "redis-primary")
 
-    # 3. 새 master에서 실제로 남아있는 key 확인
-    await asyncio.sleep(15)  # failover 대기
+    # 3. Sentinel failover 대기 후 새 master에서 key 확인
+    await asyncio.sleep(15)  # failover 완료 대기
     r_new = sentinel.master_for("mymaster", decode_responses=True)
     survived = 0
     lost = 0
@@ -724,12 +730,13 @@ async def test_redis_failover_write_loss():
     print(f"  Lost: {lost}/{len(success_keys)}")
     print(f"  Loss rate: {lost/len(success_keys)*100:.2f}%")
 
-    # cleanup
+    # cleanup: key 정리 + primary 재시작
     for key in success_keys:
         await r_new.delete(key)
+    _docker_compose("start", "redis-primary")
 ```
 
-Run: `pytest tests/test_redis_failover.py -v -s` (수동 docker stop 필요)
+Run: `pytest tests/test_redis_failover.py::test_redis_failover_write_loss -v -s`
 
 - [ ] **Step 2: WAIT 명령으로 유실 감소 확인**
 
