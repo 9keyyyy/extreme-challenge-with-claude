@@ -32,6 +32,12 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+
+# benchmark raw data (keep .md and .png only)
+benchmarks/**/*.json
+benchmarks/**/*.heapsnapshot
+benchmarks/**/bundle-analyzer-baseline/
 
 # vercel
 .vercel
