@@ -254,7 +254,7 @@ import json
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response  # Response: non-JSON 응답 처리용
 
 from src.services import idempotency_service
 
@@ -309,6 +309,18 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
             body = b""
             async for chunk in response.body_iterator:
                 body += chunk
+
+            # Non-JSON 응답(204 No Content 등)은 멱등성 캐싱 없이 그대로 반환
+            content_type = response.headers.get("content-type", "")
+            if not body or "application/json" not in content_type:
+                await idempotency_service.release_lock(idempotency_key)
+                return Response(
+                    content=body,
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    media_type=response.media_type,
+                )
+
             body_dict = json.loads(body)
 
             # Redis에 응답 저장 (1차)

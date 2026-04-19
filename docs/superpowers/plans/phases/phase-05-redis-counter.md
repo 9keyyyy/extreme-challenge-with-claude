@@ -311,7 +311,7 @@ async def _scan_and_collect(pattern: str) -> list[tuple[str, int]]:
         for key in keys:
             post_id = key.split(":")[1]
             delta = await redis_client.set(key, 0, get=True)
-            if delta and int(delta) > 0:
+            if delta is not None and int(delta) != 0:
                 batch.append((post_id, int(delta)))
         if cursor == 0:
             break

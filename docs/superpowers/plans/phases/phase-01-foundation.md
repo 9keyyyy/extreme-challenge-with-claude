@@ -5,9 +5,11 @@
 **학습 키워드**
 `ASGI vs WSGI` `async/await` `이벤트 루프` `Connection Pool` `ORM vs Raw SQL` `Pydantic Validation` `Optimistic Locking` `UNIQUE Constraint` `UUID vs Auto-increment` `Docker Compose` `Alembic Migration` `Clean Architecture` `Repository Pattern` `Dependency Injection` `TDD`
 
-**아키텍처:** Router → Service → Repository (클린 아키텍처, DI 기반)
+**아키텍처:** Router → Service (→ Repository는 Phase 5에서 도입)
 **개발 방식:** TDD (테스트 먼저 → 구현 → 리팩토링)
 **docker-compose:** PostgreSQL만 (Redis는 Phase 4, MinIO는 Phase 8에서 추가)
+
+> **의도적 단순화:** Phase 1에서는 서비스 함수가 SQLAlchemy를 직접 사용함. Repository 패턴(데이터 접근 계층 분리)과 DI는 Phase 5에서 복잡도가 정당화될 때 도입함. YAGNI — 필요해지기 전에 추상화하지 않음.
 
 **의도적으로 느린 패턴** (후속 Phase에서 개선하며 차이 체감):
 - OFFSET 페이지네이션 → Phase 3에서 커서로 교체
@@ -170,12 +172,12 @@ src/
     post.py
     comment.py
     like.py
-  repositories/        ← 데이터 접근 계층
+  repositories/        ← Phase 5에서 도입 (지금은 생성하지 않음)
     __init__.py
     post_repository.py
     comment_repository.py
     like_repository.py
-  services/            ← 비즈니스 로직 계층
+  services/            ← 비즈니스 로직 계층 (Phase 1에서는 직접 DB 접근)
     __init__.py
     post_service.py
     comment_service.py

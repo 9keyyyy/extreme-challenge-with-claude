@@ -314,6 +314,8 @@ if __name__ == "__main__":
 
 ```python
 # src/api/command/posts.py — 각 엔드포인트에 추가
+# 주의: Task 15B에서 get_db → get_write_db로 교체함.
+# 지금은 get_db를 사용하되, Task 15B에서 src/dependencies/db.py의 get_write_db로 전환.
 from src.services import event_service
 
 @router.post("", response_model=PostResponse, status_code=201)
@@ -876,7 +878,7 @@ async def test_replication_lag_visible():
         # 2. 즉시 수정
         await client.put(
             f"{NGINX_URL}/api/posts/{post_id}",
-            json={"title": "Lag Test Updated", "content": "Modified"},
+            json={"title": "Lag Test Updated", "content": "Modified", "version": 1},
         )
 
         # 3. 쿠키 없이 즉시 읽기 → replica로 라우팅 → 구버전 가능
@@ -905,7 +907,7 @@ async def test_read_your_write_consistency():
         # 2. 수정 (쿠키 갱신)
         await client.put(
             f"{NGINX_URL}/api/posts/{post_id}",
-            json={"title": "RYW Updated", "content": "Modified"},
+            json={"title": "RYW Updated", "content": "Modified", "version": 1},
         )
 
         # 3. 쿠키 포함하여 읽기 → primary로 라우팅 → 항상 최신
@@ -1095,7 +1097,7 @@ async def test_consumer_delay_cache_lag():
         # 3. 수정 (이벤트 발행됨 → Consumer가 캐시 무효화할 것)
         await client.put(
             f"{NGINX_URL}/api/posts/{post_id}",
-            json={"title": "Cache Lag Updated", "content": "v2"},
+            json={"title": "Cache Lag Updated", "content": "v2", "version": 1},
         )
 
         # 4. 즉시 읽기 — 캐시에 구버전이 남아있을 수 있음

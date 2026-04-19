@@ -111,9 +111,9 @@ docker compose -f docker-compose.distributed.yml --profile core --profile replic
 
 | Profile | 컨테이너 | 예상 리소스 |
 |---------|---------|-----------|
-| core | API 3 + Nginx + Redis primary/replica + Sentinel 3 + PG + MinIO | ~10개, 약 3GB RAM |
-| + replica | + PG replica | ~11개, 약 3.5GB RAM |
-| + monitoring | + Prometheus + Grafana + Jaeger | ~14개, 약 5GB RAM |
+| core | API 3 + Nginx + Redis primary/replica + Sentinel 3 + PG + MinIO | 11개, 약 3GB RAM |
+| + replica | + PG replica | 12개, 약 3.5GB RAM |
+| + monitoring | + Prometheus + Grafana + Jaeger | 15개, 약 5GB RAM |
 
 M1/M2 16GB 맥에서 core + replica까지는 여유 있음. monitoring까지 올리면 빡빡하지만 가능.
 
@@ -345,21 +345,24 @@ services:
       - "9001:9001"
     profiles: ["core"]
 
-  # === Workers (Phase 5+에서 사용) ===
+  # === Workers ===
+  # 주의: counter-sync는 Phase 5, event-consumer는 Phase 7에서 코드를 생성함.
+  # Phase 4.5 시점에서는 이 컨테이너들이 시작 실패함 (모듈 없음) — 정상.
+  # 해당 Phase 구현 후부터 동작함.
 
   counter-sync:
     build: .
     command: python -m src.workers.counter_sync
     environment: *app-env
     depends_on: [db, redis-primary]
-    profiles: ["core"]
+    profiles: ["workers"]
 
   event-consumer:
     build: .
     command: python -m src.workers.event_consumer
     environment: *app-env
     depends_on: [db, redis-primary]
-    profiles: ["core"]
+    profiles: ["workers"]
 
   # === Replica Profile: PG Primary/Replica ===
 
