@@ -36,6 +36,18 @@ export function generatePostListItem(
   };
 }
 
+export function generateNPostListItems(n: number): PostListItem[] {
+  return Array.from({ length: n }, (_, i) => ({
+    id: String(i + 1),
+    title: `벤치마크 게시글 ${i + 1}`,
+    author: `user${i % 100}`,
+    viewCount: i * 3,
+    likeCount: i % 50,
+    commentCount: i % 20,
+    createdAt: new Date(Date.now() - i * 60000).toISOString(),
+  }));
+}
+
 export const db = {
   posts: Array.from({ length: 20 }, () => generatePost()),
 
