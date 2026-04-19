@@ -142,6 +142,8 @@ SLA: 이 프로젝트는 개인 프로젝트라 SLA 없음. 하지만 SLO를 정
 
 ## 구현
 
+> **TDD 참고:** 이 Phase는 모니터링 인프라(Prometheus/Grafana/Jaeger) 구성이 중심. 메트릭 엔드포인트와 트레이싱 미들웨어에 대해서만 TDD 적용.
+
 ### Task 17: 모니터링 스택 구성
 
 **Files:**

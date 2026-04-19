@@ -3,7 +3,19 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans
 
 **학습 키워드**
-`ASGI vs WSGI` `async/await` `이벤트 루프` `Connection Pool` `ORM vs Raw SQL` `Pydantic Validation` `Optimistic Locking` `UNIQUE Constraint` `UUID vs Auto-increment` `Docker Compose` `Alembic Migration`
+`ASGI vs WSGI` `async/await` `이벤트 루프` `Connection Pool` `ORM vs Raw SQL` `Pydantic Validation` `Optimistic Locking` `UNIQUE Constraint` `UUID vs Auto-increment` `Docker Compose` `Alembic Migration` `Clean Architecture` `Repository Pattern` `Dependency Injection` `TDD`
+
+**아키텍처:** Router → Service (→ Repository는 Phase 5에서 도입)
+**개발 방식:** TDD (테스트 먼저 → 구현 → 리팩토링)
+**docker-compose:** PostgreSQL만 (Redis는 Phase 4, MinIO는 Phase 8에서 추가)
+
+> **의도적 단순화:** Phase 1에서는 서비스 함수가 SQLAlchemy를 직접 사용함. Repository 패턴(데이터 접근 계층 분리)과 DI는 Phase 5에서 복잡도가 정당화될 때 도입함. YAGNI — 필요해지기 전에 추상화하지 않음.
+
+**의도적으로 느린 패턴** (후속 Phase에서 개선하며 차이 체감):
+- OFFSET 페이지네이션 → Phase 3에서 커서로 교체
+- 조회수 DB 직접 UPDATE → Phase 5에서 Redis INCR로 교체
+- 좋아요 DB 직접 UPDATE → Phase 5에서 Redis INCR로 교체
+- 캐시 없음 → Phase 4에서 Redis 캐시 추가
 
 ---
 
@@ -82,7 +94,45 @@ max_overflow=10 → 부하 시 최대 15개까지 확장
 
 ### Docker Compose — 왜 Docker인가?
 
-로컬에서 PostgreSQL + Redis + MinIO + 모니터링을 `docker compose up` 한 줄로 띄울 수 있음. "내 컴퓨터에서는 되는데..." 문제를 원천 차단하고, 개발 환경과 프로덕션 환경의 차이를 최소화함. 클라우드 배포 시에도 같은 컨테이너 이미지를 그대로 사용.
+로컬에서 PostgreSQL을 `docker compose up` 한 줄로 띄울 수 있음. "내 컴퓨터에서는 되는데..." 문제를 원천 차단하고, 개발 환경과 프로덕션 환경의 차이를 최소화함. 클라우드 배포 시에도 같은 컨테이너 이미지를 그대로 사용. (Phase 1에서는 PostgreSQL만. Redis, MinIO는 해당 Phase에서 추가.)
+
+### 클린 아키텍처 — Router → Service → Repository
+
+```
+┌─────────┐     ┌──────────┐     ┌──────────────┐     ┌────┐
+│  Router  │ ──→ │  Service  │ ──→ │  Repository  │ ──→ │ DB │
+│ (API)    │     │ (비즈니스)│     │ (데이터접근) │     │    │
+└─────────┘     └──────────┘     └──────────────┘     └────┘
+   Depends         Depends           Depends(get_db)
+```
+
+**각 계층의 책임:**
+- **Router (api/):** HTTP 요청/응답 변환, 상태코드 결정. 비즈니스 로직 없음
+- **Service (services/):** 비즈니스 로직, 트랜잭션 조율. SQLAlchemy import 없음
+- **Repository (repositories/):** DB 쿼리만. SQLAlchemy 의존이 여기에만 있음
+
+**DI (Dependency Injection) — FastAPI `Depends()` 활용:**
+
+```python
+# Repository — DB 세션 주입
+class PostRepository:
+    def __init__(self, db: AsyncSession = Depends(get_db)):
+        self.db = db
+
+# Service — Repository 주입 (SQLAlchemy를 모름)
+class PostService:
+    def __init__(self, repo: PostRepository = Depends()):
+        self.repo = repo
+
+# Router — Service 주입 (DB를 모름)
+@router.post("")
+async def create_post(data: PostCreate, service: PostService = Depends()):
+    return await service.create_post(data)
+```
+
+FastAPI가 요청마다 DI 체인을 자동으로 풀어줌: `get_db()` → `PostRepository(db)` → `PostService(repo)` → `create_post(service)`.
+
+현재는 구체 클래스 의존 (느슨한 결합이 아님). Phase 5에서 Repository를 Redis 기반으로 교체할 때 Protocol(인터페이스)을 도입해서 진짜 느슨한 결합으로 발전시킴. → [Phase 5 참고](phase-05-redis-counter.md)
 
 ### 심화 학습
 
@@ -93,12 +143,70 @@ max_overflow=10 → 부하 시 최대 15개까지 확장
 | **UUID vs Auto-increment PK** | Auto-increment는 DB 1대에서만 유일성 보장. 서버 여러 대에서 동시 INSERT하면 충돌 위험. UUID는 어디서든 생성해도 충돌 확률이 사실상 0이지만, 랜덤 UUID는 B-tree 인덱스에서 페이지 분할을 유발해서 INSERT 성능이 떨어짐. UUIDv7(시간 순서)이 대안 |
 | **Pydantic v2** | Rust 기반 검증 엔진으로 v1 대비 5-50배 빠름. 극한 트래픽에서 요청 파싱/검증 비용이 무시 못 할 수준이 되면 이 차이가 체감됨 |
 | **SQLAlchemy 2.0 스타일** | 1.x의 `session.query(Model).filter()` → 2.0의 `select(Model).where()`. 2.0 스타일이 async와 호환되고, 타입 힌트 지원이 나음 |
+| **Repository Pattern** | 데이터 접근을 추상화. Service가 "어디서 데이터를 가져오는지"를 모르게 함. DB → Redis 교체 시 Service 코드 변경 없이 Repository만 교체 가능 |
+| **Dependency Injection** | 의존성을 외부에서 주입. 테스트에서 Mock 교체가 쉬워지고, 계층 간 결합도가 낮아짐. FastAPI는 `Depends()`로 내장 지원 |
 
 ---
 
-## 구현
+## 프로젝트 구조
 
-### Task 1: 프로젝트 초기화 + Docker Compose
+```
+pyproject.toml
+Dockerfile
+docker-compose.yml
+docker/
+  init-test-db.sql
+src/
+  __init__.py
+  main.py
+  config.py
+  database.py
+  models/
+    __init__.py        (모든 모델 re-export — Alembic용)
+    base.py            (DeclarativeBase)
+    post.py
+    comment.py
+    like.py
+  schemas/
+    __init__.py
+    post.py
+    comment.py
+    like.py
+  repositories/        ← Phase 5에서 도입 (지금은 생성하지 않음)
+    __init__.py
+    post_repository.py
+    comment_repository.py
+    like_repository.py
+  services/            ← 비즈니스 로직 계층 (Phase 1에서는 직접 DB 접근)
+    __init__.py
+    post_service.py
+    comment_service.py
+    like_service.py
+  api/                 ← 플랫 구조 (CQRS 분리는 Phase 7)
+    __init__.py
+    posts.py
+    comments.py
+    likes.py
+alembic.ini
+alembic/
+  env.py (async)
+  script.py.mako
+  versions/
+tests/
+  __init__.py
+  conftest.py
+  test_posts.py
+  test_comments.py
+  test_likes.py
+```
+
+---
+
+## 구현 (TDD)
+
+개발 방식: **테스트 먼저 작성 (RED)** → **최소 구현 (GREEN)** → **리팩토링 (REFACTOR)**
+
+### Task 1: 프로젝트 셋업
 
 **Files:**
 - Create: `pyproject.toml`
@@ -902,11 +1010,14 @@ git commit -m "feat: Comment + Like with DB constraints (naive counter)"
 
 ## Phase 1 완료 체크리스트
 
-- [ ] Docker Compose로 PG + Redis + MinIO + App 구동
+- [ ] Docker Compose로 PostgreSQL + App 구동 (Redis/MinIO 없음)
+- [ ] Router → Service → Repository 계층 분리 + DI 적용
 - [ ] Post CRUD API 동작 (생성, 조회, 목록, 수정, 삭제)
-- [ ] 낙관적 락으로 동시 수정 감지
+- [ ] 낙관적 락: atomic `UPDATE...WHERE version=X` (race condition 없음)
 - [ ] Comment CRUD 동작
 - [ ] Like 토글 + UNIQUE 제약 + DB 카운터
-- [ ] 전체 테스트 통과
+- [ ] Alembic async 마이그레이션 동작
+- [ ] TDD: 테스트 먼저 작성 후 구현
+- [ ] 전체 테스트 통과 (테스트 DB 분리 + 트랜잭션 rollback 격리)
 
 **다음:** [Phase 2 — 100만 데이터 병목 체감](phase-02-bottleneck.md)

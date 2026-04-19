@@ -141,7 +141,11 @@ Redis NX(SET if Not eXists) 는 원자적 연산임. "없으면 SET하고 성공
 
 ---
 
-## 구현
+## 구현 (TDD)
+
+개발 방식: **테스트 먼저 작성 (RED)** → **최소 구현 (GREEN)** → **리팩토링 (REFACTOR)**
+
+> Task 13이 이미 TDD 흐름 — 중복 생성 테스트(RED) 먼저 작성 후, Task 14에서 미들웨어 구현(GREEN). Task 14A(분산 락/Fencing Token)도 테스트 먼저.
 
 ### Task 13: 멱등성 없이 중복 발생 확인
 
@@ -250,7 +254,7 @@ import json
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response  # Response: non-JSON 응답 처리용
 
 from src.services import idempotency_service
 
@@ -266,12 +270,32 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
         if not idempotency_key:
             return await call_next(request)
 
-        # 이전 응답 확인
+        # 1차: Redis에서 이전 응답 확인 (빠름, 0.1ms)
         existing = await idempotency_service.check_idempotency(idempotency_key)
         if existing:
             return JSONResponse(
                 status_code=existing["status"], content=existing["body"]
             )
+
+        # 2차: DB에서 이전 응답 확인 (Redis TTL 만료 or Redis 장애 대비)
+        from src.database import async_session
+        from src.models.idempotency import IdempotencyKey
+        from sqlalchemy import select
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(IdempotencyKey).where(IdempotencyKey.key == idempotency_key)
+            )
+            db_entry = result.scalar_one_or_none()
+            if db_entry:
+                body = json.loads(db_entry.response_body)
+                # Redis에 다시 캐싱 (복구)
+                await idempotency_service.save_response(
+                    idempotency_key, db_entry.response_status, body
+                )
+                return JSONResponse(
+                    status_code=db_entry.response_status, content=body
+                )
 
         # 락 획득
         if not await idempotency_service.acquire_lock(idempotency_key):
@@ -285,11 +309,36 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
             body = b""
             async for chunk in response.body_iterator:
                 body += chunk
+
+            # Non-JSON 응답(204 No Content 등)은 멱등성 캐싱 없이 그대로 반환
+            content_type = response.headers.get("content-type", "")
+            if not body or "application/json" not in content_type:
+                await idempotency_service.release_lock(idempotency_key)
+                return Response(
+                    content=body,
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    media_type=response.media_type,
+                )
+
             body_dict = json.loads(body)
 
+            # Redis에 응답 저장 (1차)
             await idempotency_service.save_response(
                 idempotency_key, response.status_code, body_dict
             )
+            # DB에 응답 저장 (2차 안전망 — Redis TTL 만료/장애 대비)
+            async with async_session() as db:
+                db.add(IdempotencyKey(
+                    key=idempotency_key,
+                    response_status=response.status_code,
+                    response_body=json.dumps(body_dict),
+                ))
+                try:
+                    await db.commit()
+                except Exception:
+                    await db.rollback()  # ON CONFLICT — 이미 있으면 무시
+
             return JSONResponse(
                 status_code=response.status_code, content=body_dict
             )
@@ -336,15 +385,367 @@ git commit -m "feat: idempotency middleware — Redis lock + response caching"
 
 ---
 
+### Task 14A: 분산 락 한계 체험 + Fencing Token
+
+> **전제:** Task 14 완료 + Phase 4.5의 분산 환경이 동작하는 상태.
+
+**학습 키워드 추가**
+`Fencing Token` `Distributed Lock Failure Modes` `TTL Expiry Race` `Redlock Controversy` `Kleppmann vs Antirez` `Mock External API`
+
+**Files:**
+- Create: `tests/test_distributed_idempotency.py`
+- Create: `src/services/mock_notification.py`
+- Modify: `src/services/idempotency_service.py`
+- Modify: `src/models/idempotency.py`
+
+#### 학습: 분산 락의 실패 모드 — "언제 Fencing Token이 필요한가"
+
+Task 14에서 Redis SET NX로 멱등성 락을 구현함. 단일 인스턴스에서는 잘 동작하지만, 멀티 인스턴스에서 생각해야 할 실패 모드가 있음.
+
+**TTL 만료 시나리오:**
+
+```
+1. 서버 A가 멱등성 키 "abc"로 Redis 락 획득 (TTL 30초)
+2. 서버 A가 비즈니스 로직 실행... 근데 DB가 느림 (GC 폭발, 디스크 I/O)
+3. 35초 경과 → TTL 만료 → 락 자동 해제
+4. 서버 B가 같은 키 "abc"로 락 획득 → 비즈니스 로직 시작
+5. 서버 A 완료 → 서버 B 완료
+6. 결과: ???
+```
+
+여기서 핵심 질문: **결과가 뭐냐?**
+
+**downstream이 DB(unique constraint)라면:**
+- 서버 A의 INSERT 성공 → 서버 B의 INSERT는 `ON CONFLICT DO NOTHING`으로 무시됨
+- 결과: 게시글 1개만 생성. **문제없음.**
+- DB unique constraint가 2차 안전망으로 동작.
+
+**downstream이 외부 API(알림, 결제)라면:**
+- 서버 A의 알림 API 호출 성공 → 서버 B의 알림 API 호출도 성공
+- 결과: 알림 2번 발송. **문제 있음.**
+- 외부 API에는 unique constraint 같은 보호 장치가 없음.
+
+**핵심 판단: "downstream이 자연적 멱등성을 가지는가?"**
+
+| downstream | 자연적 멱등성 | Fencing Token 필요? |
+|-----------|------------|-------------------|
+| DB INSERT + unique constraint | 있음 (ON CONFLICT) | 불필요 — 오버엔지니어링 |
+| DB UPSERT | 있음 (덮어쓰기) | 불필요 |
+| 외부 결제 API | 없음 (PG사가 멱등성 키 안 받으면) | **필요** |
+| 알림 발송 API | 없음 | **필요** |
+| 이메일 발송 | 없음 | **필요** |
+
+**Fencing Token 원리:**
+
+```
+1. 서버 A가 락 획득 → fencing token #1 발급 (단조증가)
+2. TTL 만료
+3. 서버 B가 락 획득 → fencing token #2 발급
+4. 서버 A가 token #1로 외부 API 호출 → API가 "token #2를 이미 봤으므로 #1은 거부"
+결과: 서버 B의 호출만 유효.
+```
+
+**Redlock 논쟁 — 요약:**
+- **Antirez (Redis 저자):** Redis N대(5대) 중 과반수에 락 걸면 충분히 안전함
+- **Kleppmann:** 비동기 시스템에서 clock 가정은 위험. GC pause, 네트워크 지연으로 락이 만료된 줄 모르고 동작할 수 있음. Fencing Token이 근본적 해결책
+- **결론:** 은탄환은 없음. Redlock은 복잡도 대비 안전성이 불확실. 대부분의 경우 "단순 TTL 락 + downstream 보호(fencing token or DB constraint)"가 실용적
+
+---
+
+- [ ] **Step 1: 멀티 인스턴스 멱등성 기본 동작 확인**
+
+```python
+# tests/test_distributed_idempotency.py
+import asyncio
+import httpx
+import pytest
+
+NGINX_URL = "http://localhost"  # Nginx LB
+
+
+@pytest.mark.asyncio
+async def test_distributed_idempotency_basic():
+    """Nginx 통해 같은 멱등성 키 100건 동시 전송 → 정확히 1건만 생성"""
+    key = f"dist-test-{asyncio.get_event_loop().time()}"
+    payload = {"title": "Distributed Idempotency", "content": "Test", "author": "tester"}
+
+    async with httpx.AsyncClient() as client:
+        tasks = [
+            client.post(
+                f"{NGINX_URL}/api/posts",
+                json=payload,
+                headers={"Idempotency-Key": key},
+                timeout=10,
+            )
+            for _ in range(100)
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    successful = [r for r in responses if not isinstance(r, Exception)]
+    # 캐시된 응답도 원래 status(201)를 그대로 반환함.
+    # 구분 불가 — 대신 "201 응답의 게시글 ID가 전부 동일한지"로 검증.
+    ok_responses = [r for r in successful if r.status_code == 201]
+    conflicts = [r for r in successful if r.status_code == 409]
+
+    assert len(ok_responses) >= 1, "At least 1 successful response expected"
+    print(f"201 responses: {len(ok_responses)}, Conflicts: {len(conflicts)}")
+    print(f"Total: {len(ok_responses) + len(conflicts)} / {len(successful)} successful")
+
+    # 핵심 검증: 모든 201 응답이 같은 게시글 ID를 반환해야 함
+    ids = {r.json()["id"] for r in ok_responses}
+    assert len(ids) == 1, f"Expected 1 unique post ID but got {len(ids)}: {ids}"
+    print(f"All {len(ok_responses)} responses returned same post ID: {ids.pop()}")
+```
+
+Run: `pytest tests/test_distributed_idempotency.py::test_distributed_idempotency_basic -v`
+
+Expected: Created 1건, 나머지는 Cached(200) 또는 Conflict(409).
+
+- [ ] **Step 2: TTL 만료 시나리오 — DB constraint가 막아주는 것 확인**
+
+```python
+# tests/test_distributed_idempotency.py에 추가
+
+
+@pytest.mark.asyncio
+async def test_ttl_expiry_db_constraint_saves():
+    """TTL 만료 시 DB unique constraint가 2차 안전망으로 동작하는지 확인.
+
+    이 테스트는 개념 검증임. 실제 TTL 만료는 sleep(35)로 재현하면
+    테스트가 35초 걸리므로, 대신 Redis 락을 수동으로 삭제해서 시뮬레이션.
+    """
+    key = f"ttl-test-{asyncio.get_event_loop().time()}"
+    payload = {"title": "TTL Expiry Test", "content": "Test", "author": "tester"}
+
+    async with httpx.AsyncClient() as client:
+        # 1. 첫 번째 요청 — 정상 생성
+        r1 = await client.post(
+            f"{NGINX_URL}/api/posts",
+            json=payload,
+            headers={"Idempotency-Key": key},
+            timeout=10,
+        )
+        assert r1.status_code == 201
+        first_id = r1.json()["id"]
+
+        # 2. Redis에서 멱등성 키 삭제 (TTL 만료 시뮬레이션)
+        # Sentinel을 통해 master에 접근 — compose에서 redis-primary에 포트 매핑 없음
+        import redis.asyncio as redis_lib
+        from redis.asyncio.sentinel import Sentinel
+        sentinel = Sentinel(
+            [("localhost", 26379)],  # sentinel-1이 26379 포트를 노출해야 함
+            socket_timeout=3,
+        )
+        r = sentinel.master_for("mymaster", decode_responses=True)
+        await r.delete(f"idempotency:{key}")
+        await r.aclose()
+
+        # 3. 같은 키로 다시 요청 — Redis에는 키가 없지만 DB에 키가 있음
+        r2 = await client.post(
+            f"{NGINX_URL}/api/posts",
+            json=payload,
+            headers={"Idempotency-Key": key},
+            timeout=10,
+        )
+
+        # 미들웨어가 DB를 2차 체크하므로, DB에서 이전 응답을 찾아 반환함
+        assert r2.status_code == 201, f"Expected 201 but got {r2.status_code}"
+        assert r2.json()["id"] == first_id, "DB 2차 안전망 실패 — 새 게시글 생성됨!"
+        print(f"After TTL expiry simulation: DB에서 이전 응답 반환 확인. status={r2.status_code}")
+```
+
+Run: `pytest tests/test_distributed_idempotency.py::test_ttl_expiry_db_constraint_saves -v`
+
+- [ ] **Step 3: 외부 API 호출 시 Fencing Token 없으면 이중 호출 발생 (단일 프로세스 개념 증명)**
+
+아래 테스트는 HTTP/Nginx를 거치지 않고 직접 함수를 호출하는 단일 프로세스 테스트임. "서버 A가 호출, 서버 B가 호출"을 코드 레벨에서 시뮬레이션하는 개념 증명. 실제 멀티 인스턴스 시나리오는 Step 4의 통합 테스트에서 `acquire_lock_with_fencing`과 함께 검증.
+
+```python
+# src/services/mock_notification.py
+"""외부 알림 API Mock — Fencing Token 학습용.
+
+실제 외부 API를 시뮬레이션. call_log에 호출 이력이 쌓임.
+멱등성이 없어서 같은 요청이 2번 오면 2번 다 실행됨.
+"""
+
+call_log: list[dict] = []
+
+
+async def send_notification(post_id: str, title: str, fencing_token: int | None = None):
+    """알림 발송. fencing_token이 있으면 검증."""
+    if fencing_token is not None:
+        # Fencing Token 검증: 이미 더 높은 토큰을 본 적 있으면 거부
+        for entry in call_log:
+            if entry["post_id"] == post_id and entry.get("fencing_token", 0) > fencing_token:
+                return {"status": "rejected", "reason": "stale fencing token"}
+
+    entry = {"post_id": post_id, "title": title, "fencing_token": fencing_token}
+    call_log.append(entry)
+    return {"status": "sent"}
+
+
+def get_call_count(post_id: str) -> int:
+    return sum(1 for e in call_log if e["post_id"] == post_id)
+
+
+def clear_log():
+    call_log.clear()
+```
+
+```python
+# tests/test_distributed_idempotency.py에 추가
+from src.services.mock_notification import (
+    clear_log,
+    get_call_count,
+    send_notification,
+)
+
+
+@pytest.mark.asyncio
+async def test_no_fencing_token_double_notification():
+    """Fencing Token 없이 TTL 만료 → 알림 2번 발송"""
+    clear_log()
+    post_id = "post-123"
+
+    # 서버 A의 호출 (TTL 만료 후에도 완료됨)
+    await send_notification(post_id, "New Post")
+    # 서버 B의 호출 (새 락으로 진입)
+    await send_notification(post_id, "New Post")
+
+    assert get_call_count(post_id) == 2, "알림이 2번 발송됨 — Fencing Token 없으면 막을 수 없음"
+
+
+@pytest.mark.asyncio
+async def test_fencing_token_prevents_double_notification():
+    """Fencing Token으로 구 토큰 요청 거부"""
+    clear_log()
+    post_id = "post-456"
+
+    # 서버 B가 먼저 완료 (token=2)
+    r2 = await send_notification(post_id, "New Post", fencing_token=2)
+    assert r2["status"] == "sent"
+
+    # 서버 A가 뒤늦게 완료 (token=1, 구 토큰)
+    r1 = await send_notification(post_id, "New Post", fencing_token=1)
+    assert r1["status"] == "rejected"
+
+    assert get_call_count(post_id) == 1, "Fencing Token 덕분에 1번만 발송됨"
+```
+
+Run: `pytest tests/test_distributed_idempotency.py -k "fencing" -v`
+
+- [ ] **Step 4: Fencing Token 발급을 멱등성 서비스에 추가 + 통합 흐름 테스트**
+
+```python
+# src/services/idempotency_service.py에 추가
+
+FENCING_COUNTER_KEY = "idempotency:fencing_counter"
+
+
+async def acquire_lock_with_fencing(key: str) -> int | None:
+    """락 획득 + fencing token 발급.
+
+    Returns: fencing token (int) if lock acquired, None if lock already held.
+    """
+    locked = await redis_client.set(
+        f"idempotency:{key}", '"processing"', nx=True, ex=30
+    )
+    if not locked:
+        return None
+    # 단조증가 fencing token 발급
+    token = await redis_client.incr(FENCING_COUNTER_KEY)
+    return token
+```
+
+```python
+# src/models/idempotency.py — fencing_token 컬럼 추가
+
+class IdempotencyKey(Base):
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    response_status: Mapped[int] = mapped_column()
+    response_body: Mapped[str] = mapped_column(Text)
+    fencing_token: Mapped[int] = mapped_column(default=0)  # 추가
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+```
+
+```python
+# tests/test_distributed_idempotency.py에 추가 — fencing token 통합 흐름
+
+from src.services.idempotency_service import acquire_lock_with_fencing
+
+
+@pytest.mark.asyncio
+async def test_fencing_token_integrated_flow():
+    """acquire_lock_with_fencing → send_notification 전체 흐름.
+
+    실제 멀티 인스턴스 시나리오 시뮬레이션:
+    1. 서버 A가 락 + fencing token 획득
+    2. TTL 만료 (수동 삭제로 시뮬레이션)
+    3. 서버 B가 새 락 + 더 높은 fencing token 획득
+    4. 서버 B가 먼저 알림 발송 (token=2)
+    5. 서버 A가 뒤늦게 알림 발송 시도 (token=1) → 거부됨
+    """
+    clear_log()
+    post_id = "integrated-test"
+
+    # conftest.py에서 init_redis() 호출 필요 (Phase 5 테스트와 동일)
+    from src.redis_client import redis_client
+
+    # 서버 A: 락 + token 획득
+    token_a = await acquire_lock_with_fencing("integrated-key-1")
+    assert token_a is not None
+
+    # TTL 만료 시뮬레이션
+    await redis_client.delete("idempotency:integrated-key-1")
+
+    # 서버 B: 새 락 + 더 높은 token
+    token_b = await acquire_lock_with_fencing("integrated-key-1")
+    assert token_b is not None
+    assert token_b > token_a, f"token_b({token_b}) should be > token_a({token_a})"
+
+    # 서버 B가 먼저 완료 → 알림 발송
+    r_b = await send_notification(post_id, "New Post", fencing_token=token_b)
+    assert r_b["status"] == "sent"
+
+    # 서버 A가 뒤늦게 완료 → 구 token으로 알림 시도 → 거부
+    r_a = await send_notification(post_id, "New Post", fencing_token=token_a)
+    assert r_a["status"] == "rejected"
+
+    assert get_call_count(post_id) == 1, "Fencing token 통합 흐름: 1번만 발송"
+```
+
+- [ ] **Step 5: Alembic 마이그레이션 + Commit**
+
+```bash
+alembic revision --autogenerate -m "add fencing_token to idempotency_keys"
+alembic upgrade head
+git add -A
+git commit -m "feat: distributed lock limits — fencing token for external API idempotency"
+```
+
+---
+
 ## Phase 6 완료 체크리스트
 
 - [ ] 멱등성 없이 중복 생성되는 문제 확인
 - [ ] 멱등성 미들웨어 구현 (Redis 1차 + DB 2차)
 - [ ] 같은 키로 N번 요청해도 결과 1번과 동일 확인
 - [ ] 동시 같은 키 요청 시 409 Conflict 확인
+- [ ] 멀티 인스턴스에서 같은 멱등성 키 100건 → 1건만 생성 확인
+- [ ] TTL 만료 시 DB constraint가 2차 안전망 역할 확인
+- [ ] 외부 API 호출 시 Fencing Token 없으면 이중 호출 체험
+- [ ] Fencing Token으로 구 토큰 거부 확인
+- [ ] "Fencing Token이 필요한 경우 vs 불필요한 경우" 판단 학습
 
 **핵심 체감:**
 - 멱등성 없음: 같은 요청 5번 = 게시글 5개
 - 멱등성 있음: 같은 요청 5번 = 게시글 1개 + 4번은 캐시된 응답
+- DB downstream: TTL 만료돼도 unique constraint가 막음 → Fencing Token 불필요
+- 외부 API downstream: TTL 만료 시 이중 호출 → Fencing Token 필요
+- **"항상 최강 도구가 아니라, 상황에 맞는 도구를 고르는 게 시니어"**
 
 **다음:** [Phase 7 — CQRS + Events](phase-07-cqrs-events.md)

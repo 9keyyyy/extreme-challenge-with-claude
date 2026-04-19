@@ -133,7 +133,11 @@ def validate_magic_bytes(file_bytes: bytes, declared_type: str) -> bool:
 
 ---
 
-## 구현
+## 구현 (TDD)
+
+개발 방식: **테스트 먼저 작성 (RED)** → **최소 구현 (GREEN)** → **리팩토링 (REFACTOR)**
+
+> Presigned URL 발급/업로드/조회 테스트를 먼저 작성 후 구현. MinIO 연결 설정은 인프라라 TDD 대상 아님.
 
 ### Task 16: MinIO Presigned URL 업로드
 
