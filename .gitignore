@@ -1,4 +1,16 @@
+# Claude / IDE
 .claude/settings.json
 .claude/settings.local.json
 .idea/
 .superpowers/
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/

@@ -1,0 +1,26 @@
+[project]
+name = "extreme-board"
+version = "0.1.0"
+description = "Extreme traffic bulletin board backend"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.14.0",
+    "asyncpg>=0.30.0",
+    "fastapi>=0.115.0",
+    "pydantic-settings>=2.0.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# 모든 테스트와 fixture가 같은 이벤트 루프 공유 — 테스트 간 커넥션 풀 충돌 방지
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
