@@ -1,5 +1,5 @@
 import { HttpResponse, http } from "msw";
-import { db } from "./data";
+import { db, generateNPostListItems } from "./data";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -16,6 +16,17 @@ export const handlers = [
     const url = new URL(request.url);
     const page = Number(url.searchParams.get("page") ?? "1");
     const pageSize = Number(url.searchParams.get("page_size") ?? "20");
+
+    if (pageSize > 500) {
+      return HttpResponse.json({
+        items: generateNPostListItems(pageSize),
+        total: pageSize,
+        page: 1,
+        pageSize,
+        hasNext: false,
+      });
+    }
+
     return HttpResponse.json(db.getPaginatedPosts(page, pageSize));
   }),
 
