@@ -1,0 +1,4 @@
+interface:
+  display_name: "Phase Harness"
+  short_description: "TDD phase implementation workflow"
+  default_prompt: "Use the phase harness workflow to implement the selected project phase end to end."
